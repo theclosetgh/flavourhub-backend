@@ -4,27 +4,27 @@ import cors from "cors";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// ✅ CORS FIX (GitHub Pages)
+// CORS: allow your GitHub Pages origin (and local dev)
 const ALLOWED_ORIGINS = [
-  "https://theclosetgh.github.io"
+  "https://theclosetgh.github.io",
+  "http://localhost:5500",
+  "http://127.0.0.1:5500"
 ];
 
 app.use(cors({
   origin: (origin, cb) => {
-    // allow server-to-server / curl (no origin)
-    if (!origin) return cb(null, true);
+    if (!origin) return cb(null, true); // server-to-server
     if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(new Error("CORS blocked: " + origin));
+    return cb(null, false); // block other origins
   },
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
-// ✅ Preflight handler
 app.options("*", cors());
 
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY; // sk_test... or sk_live...
-const PAYSTACK_PUBLIC_KEY = process.env.PAYSTACK_PUBLIC_KEY; // pk_test... or pk_live...
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY; // sk_test... / sk_live...
+const PAYSTACK_PUBLIC_KEY = process.env.PAYSTACK_PUBLIC_KEY; // pk_test... / pk_live...
 const PAYSTACK_BASE = "https://api.paystack.co";
 
 app.get("/", (req, res) => {
@@ -97,7 +97,7 @@ app.get("/api/paystack/verify/:reference", async (req, res) => {
       return res.status(400).json({ error: psData?.message || "Verification failed.", raw: psData });
     }
 
-    const status = psData.data.status; // success, failed, abandoned
+    const status = psData.data.status; // success / failed / abandoned
     res.json({
       paid: status === "success",
       status,
