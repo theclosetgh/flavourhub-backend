@@ -25,7 +25,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
 app.use(
   cors({
     origin: function (origin, cb) {
-      if (!origin) return cb(null, true); // allow server-to-server / tools
+      if (!origin) return cb(null, true);
       if (ALLOWED_ORIGINS.length === 0) return cb(null, true);
       if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
       return cb(new Error("CORS blocked: " + origin), false);
@@ -36,7 +36,7 @@ app.use(
 );
 
 /* -------------------------
-   HELPERS
+   Helpers
 ------------------------- */
 function requireEnv(name) {
   const v = (process.env[name] || "").trim();
@@ -45,7 +45,7 @@ function requireEnv(name) {
 }
 
 /* -------------------------
-   HEALTH
+   Health
 ------------------------- */
 app.get("/api/health", (req, res) => {
   res.json({
@@ -62,10 +62,9 @@ app.get("/api/health", (req, res) => {
 });
 
 /* -------------------------
-   MENU STORAGE (menu.json)
-   NOTE: Render filesystem can reset on redeploy.
-   Menu text is usually fine, but if you want true permanence,
-   we can move menu storage to DB later.
+   Menu Storage (menu.json)
+   NOTE: File storage may reset on redeploy. If you want permanent menu,
+   we can move it to a database later.
 ------------------------- */
 const DATA_FILE = path.join(process.cwd(), "menu.json");
 
@@ -136,12 +135,13 @@ function defaultMenu() {
       {
         name: "Local Drinks",
         items: [
-          { id: "d1", name: "Obolo Sobolo Can", price: 40, desc: "", image: "" },
-          { id: "d2", name: "Biggie Bissap Can", price: 30, desc: "", image: "" },
-          { id: "d3", name: "Smallie Can", price: 20, desc: "", image: "" },
-          { id: "d4", name: "Obolo Pine Can", price: 40, desc: "Pineapple drink.", image: "" },
-          { id: "d5", name: "Biggie Pine Can", price: 30, desc: "Pineapple drink.", image: "" },
-          { id: "d6", name: "Smallie Pine Can", price: 20, desc: "Small pineapple drink.", image: "" }
+          { id: "ld1", name: "Obolo Sobolo Can", price: 40, desc: "", image: "" },
+          { id: "ld2", name: "Biggie Bissap Can", price: 30, desc: "", image: "" },
+          { id: "ld3", name: "Smallie Can", price: 20, desc: "", image: "" },
+
+          { id: "ld4", name: "Obolo Pine Can", price: 40, desc: "Pineapple drink.", image: "" },
+          { id: "ld5", name: "Biggie Pine Can", price: 30, desc: "Pineapple drink.", image: "" },
+          { id: "ld6", name: "Smallie Pine Can", price: 20, desc: "Small pineapple drink.", image: "" }
         ]
       }
     ]
@@ -173,7 +173,7 @@ function writeMenu(menu) {
 app.get("/api/menu", (req, res) => res.json(readMenu()));
 
 /* -------------------------
-   ADMIN AUTH (JWT)
+   Admin Auth (JWT)
 ------------------------- */
 function signToken() {
   const secret = requireEnv("JWT_SECRET");
@@ -215,17 +215,17 @@ app.put("/api/admin/menu", requireAdmin, (req, res) => {
   }
 
   for (const cat of menu.categories) {
-    if (!cat.name || !Array.isArray(cat.items)) {
-      return res.status(400).json({ error: "Invalid category" });
-    }
+    if (!cat.name || !Array.isArray(cat.items)) return res.status(400).json({ error: "Invalid category" });
+
     for (const it of cat.items) {
       it.id = (it.id ?? "").toString();
       it.name = (it.name ?? "").toString();
       it.desc = (it.desc ?? "").toString();
       it.image = (it.image ?? "").toString();
       it.price = Number(it.price || 0);
+
       if (!it.name) return res.status(400).json({ error: "Item name missing" });
-      if (!Number.isFinite(it.price) || it.price < 0) return res.status(400).json({ error: "Invalid price for item: " + it.name });
+      if (!Number.isFinite(it.price) || it.price < 0) return res.status(400).json({ error: "Invalid price for: " + it.name });
     }
   }
 
@@ -234,9 +234,7 @@ app.put("/api/admin/menu", requireAdmin, (req, res) => {
 });
 
 /* -------------------------
-   CLOUDINARY UPLOAD (ADMIN)
-   POST /api/admin/upload
-   FormData field: "image"
+   Cloudinary Upload (Admin)
 ------------------------- */
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME || "",
@@ -254,7 +252,7 @@ function requireCloudinaryEnv() {
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const ok = /^image\/(jpeg|png|webp)$/i.test(file.mimetype || "");
     cb(ok ? null : new Error("Only JPG/PNG/WebP allowed"), ok);
@@ -273,7 +271,6 @@ app.post("/api/admin/upload", requireAdmin, upload.single("image"), async (req, 
         {
           folder,
           resource_type: "image",
-          // Consistent sizing/performance (keeps original aspect ratio)
           transformation: [{ width: 1200, height: 1200, crop: "limit" }],
           format: "webp"
         },
@@ -282,10 +279,7 @@ app.post("/api/admin/upload", requireAdmin, upload.single("image"), async (req, 
       stream.end(req.file.buffer);
     });
 
-    return res.json({
-      url: result.secure_url,
-      public_id: result.public_id
-    });
+    return res.json({ url: result.secure_url, public_id: result.public_id });
   } catch (e) {
     console.error(e);
     return res.status(400).json({ error: e.message || "Upload failed" });
@@ -293,8 +287,8 @@ app.post("/api/admin/upload", requireAdmin, upload.single("image"), async (req, 
 });
 
 /* -------------------------
-   PAYSTACK (Initialize + Verify)
-   NOTE: uses global fetch available in Node 18+ (Render usually uses Node 18).
+   Paystack
+   (supports BOTH /api and non-/api paths)
 ------------------------- */
 async function paystackInitialize({ email, amount, currency }) {
   const secret = requireEnv("PAYSTACK_SECRET_KEY");
@@ -310,9 +304,7 @@ async function paystackInitialize({ email, amount, currency }) {
   });
 
   const data = await r.json().catch(() => ({}));
-  if (!r.ok || !data.status) {
-    throw new Error(data?.message || "Paystack initialize failed");
-  }
+  if (!r.ok || !data.status) throw new Error(data?.message || "Paystack initialize failed");
   return data.data;
 }
 
@@ -320,15 +312,9 @@ async function paystackVerify(reference) {
   const secret = requireEnv("PAYSTACK_SECRET_KEY");
   const url = `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`;
 
-  const r = await fetch(url, {
-    method: "GET",
-    headers: { Authorization: `Bearer ${secret}` }
-  });
-
+  const r = await fetch(url, { method: "GET", headers: { Authorization: `Bearer ${secret}` } });
   const data = await r.json().catch(() => ({}));
-  if (!r.ok || !data.status) {
-    throw new Error(data?.message || "Paystack verify failed");
-  }
+  if (!r.ok || !data.status) throw new Error(data?.message || "Paystack verify failed");
   return data.data;
 }
 
@@ -348,11 +334,7 @@ async function handleInitialize(req, res) {
     const pub = requireEnv("PAYSTACK_PUBLIC_KEY");
     const { email, amount, currency } = validateInitBody(req);
     const init = await paystackInitialize({ email, amount, currency });
-    return res.json({
-      public_key: pub,
-      reference: init.reference,
-      access_code: init.access_code
-    });
+    return res.json({ public_key: pub, reference: init.reference, access_code: init.access_code });
   } catch (e) {
     return res.status(400).json({ error: e.message || "Initialize failed" });
   }
@@ -372,15 +354,12 @@ async function handleVerify(req, res) {
   }
 }
 
-// Support both path styles to prevent 404 mistakes
 app.post("/api/paystack/initialize", handleInitialize);
 app.get("/api/paystack/verify/:reference", handleVerify);
 app.post("/paystack/initialize", handleInitialize);
 app.get("/paystack/verify/:reference", handleVerify);
 
 /* -------------------------
-   START
+   Start
 ------------------------- */
-app.listen(PORT, () => {
-  console.log("Server running on port", PORT);
-});
+app.listen(PORT, () => console.log("Server running on port", PORT));
