@@ -10,7 +10,7 @@ import { v2 as cloudinary } from "cloudinary";
 dotenv.config();
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 3000;
 
@@ -63,8 +63,7 @@ app.get("/api/health", (req, res) => {
 
 /* -------------------------
    Menu Storage (menu.json)
-   NOTE: File storage may reset on redeploy. If you want permanent menu,
-   we can move it to a database later.
+   NOTE: File storage may reset on redeploy.
 ------------------------- */
 const DATA_FILE = path.join(process.cwd(), "menu.json");
 
@@ -138,7 +137,6 @@ function defaultMenu() {
           { id: "ld1", name: "Obolo Sobolo Can", price: 40, desc: "", image: "" },
           { id: "ld2", name: "Biggie Bissap Can", price: 30, desc: "", image: "" },
           { id: "ld3", name: "Smallie Can", price: 20, desc: "", image: "" },
-
           { id: "ld4", name: "Obolo Pine Can", price: 40, desc: "Pineapple drink.", image: "" },
           { id: "ld5", name: "Biggie Pine Can", price: 30, desc: "Pineapple drink.", image: "" },
           { id: "ld6", name: "Smallie Pine Can", price: 20, desc: "Small pineapple drink.", image: "" }
@@ -170,7 +168,22 @@ function writeMenu(menu) {
   return data;
 }
 
+/* =========================
+   UPGRADE: PUBLIC MENU SHAPE
+   - Keep /api/menu exactly as you already use in the shop:
+     {updatedAt, categories:[{name, items:[{..., image:""}]}]}
+   - Also add /api/menu/flat (optional) for debugging
+========================= */
 app.get("/api/menu", (req, res) => res.json(readMenu()));
+
+app.get("/api/menu/flat", (req, res) => {
+  const d = readMenu();
+  const out = [];
+  for (const c of d.categories || []) {
+    for (const it of c.items || []) out.push({ ...it, category: c.name });
+  }
+  res.json({ updatedAt: d.updatedAt, items: out });
+});
 
 /* -------------------------
    Admin Auth (JWT)
@@ -208,29 +221,70 @@ app.post("/api/admin/login", (req, res) => {
   }
 });
 
-app.put("/api/admin/menu", requireAdmin, (req, res) => {
-  const menu = req.body;
-  if (!menu || !Array.isArray(menu.categories)) {
-    return res.status(400).json({ error: "Invalid menu format" });
+/* =========================
+   UPGRADE: MENU SAVE
+   - Accept both:
+     1) {categories:[{name, items:[...]}]}   (your current admin format)
+     2) [{category:"Shawarma", items:[...]}] (alternate)
+========================= */
+function coerceMenuBody(body) {
+  // Case 1: correct format
+  if (body && Array.isArray(body.categories)) return body;
+
+  // Case 2: array of {category, items}
+  if (Array.isArray(body)) {
+    return {
+      categories: body.map((c) => ({
+        name: (c.category ?? c.name ?? "Menu").toString(),
+        items: Array.isArray(c.items) ? c.items : [],
+      })),
+    };
   }
 
+  // Case 3: {menu:{categories:[...]}}
+  if (body?.menu && Array.isArray(body.menu.categories)) return body.menu;
+
+  return null;
+}
+
+function sanitizeMenu(menu) {
+  if (!menu || !Array.isArray(menu.categories)) throw new Error("Invalid menu format");
+
   for (const cat of menu.categories) {
-    if (!cat.name || !Array.isArray(cat.items)) return res.status(400).json({ error: "Invalid category" });
+    cat.name = (cat.name ?? "").toString().trim();
+    if (!cat.name) throw new Error("Category name missing");
+
+    if (!Array.isArray(cat.items)) throw new Error("Invalid items for category: " + cat.name);
 
     for (const it of cat.items) {
       it.id = (it.id ?? "").toString();
-      it.name = (it.name ?? "").toString();
+      it.name = (it.name ?? "").toString().trim();
       it.desc = (it.desc ?? "").toString();
-      it.image = (it.image ?? "").toString();
+      it.image = (it.image ?? "").toString().trim();
       it.price = Number(it.price || 0);
 
-      if (!it.name) return res.status(400).json({ error: "Item name missing" });
-      if (!Number.isFinite(it.price) || it.price < 0) return res.status(400).json({ error: "Invalid price for: " + it.name });
+      if (!it.name) throw new Error("Item name missing in: " + cat.name);
+      if (!Number.isFinite(it.price) || it.price < 0) throw new Error("Invalid price for: " + it.name);
+
+      // If your admin accidentally sends img instead of image, keep it
+      if (!it.image && it.img) it.image = (it.img ?? "").toString().trim();
     }
   }
 
-  const saved = writeMenu(menu);
-  return res.json(saved);
+  return menu;
+}
+
+app.put("/api/admin/menu", requireAdmin, (req, res) => {
+  try {
+    const menu = coerceMenuBody(req.body);
+    if (!menu) return res.status(400).json({ error: "Invalid menu format" });
+
+    const clean = sanitizeMenu(menu);
+    const saved = writeMenu(clean);
+    return res.json(saved);
+  } catch (e) {
+    return res.status(400).json({ error: e.message || "Invalid menu" });
+  }
 });
 
 /* -------------------------
@@ -288,7 +342,6 @@ app.post("/api/admin/upload", requireAdmin, upload.single("image"), async (req, 
 
 /* -------------------------
    Paystack
-   (supports BOTH /api and non-/api paths)
 ------------------------- */
 async function paystackInitialize({ email, amount, currency }) {
   const secret = requireEnv("PAYSTACK_SECRET_KEY");
