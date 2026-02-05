@@ -439,7 +439,6 @@ app.get("/api/paystack/verify/:reference", handleVerify);
 app.post("/paystack/initialize", handleInitialize);
 app.get("/paystack/verify/:reference", handleVerify);
 
-/* -------------------------
-   Start
-------------------------- */
+
+
 app.listen(PORT, () => console.log("Server running on port", PORT));
