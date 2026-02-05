@@ -1,13 +1,10 @@
 let orders = [];
 
-function createOrder(order){
+export function createOrder(order){
   orders.unshift(order);
   return order;
 }
 
-function getOrders(){
+export function getOrders(){
   return orders;
 }
-
-module.exports = { createOrder, getOrders };
-
