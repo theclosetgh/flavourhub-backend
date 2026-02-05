@@ -6,6 +6,7 @@ import path from "path";
 import jwt from "jsonwebtoken";
 import multer from "multer";
 import { v2 as cloudinary } from "cloudinary";
+import { createOrder, getOrders } from "./orders.store.js";
 
 dotenv.config();
 
@@ -188,6 +189,32 @@ app.get("/api/menu/flat", (req, res) => {
 /* -------------------------
    Admin Auth (JWT)
 ------------------------- */
+/* -------------------------
+   Orders (PAID ORDERS ONLY)
+------------------------- */
+
+// CUSTOMER → Save paid order
+app.post("/api/orders", (req, res) => {
+  try {
+    const order = {
+      id: "ORD-" + Date.now(),
+      ...req.body,
+      status: "paid",
+      createdAt: new Date().toISOString()
+    };
+
+    createOrder(order);
+    res.json({ success: true, order });
+  } catch {
+    res.status(400).json({ error: "Failed to save order" });
+  }
+});
+
+// ADMIN → View orders
+app.get("/api/orders/admin", requireAdmin, (req, res) => {
+  res.json(getOrders());
+});
+
 function signToken() {
   const secret = requireEnv("JWT_SECRET");
   return jwt.sign({ role: "admin" }, secret, { expiresIn: "12h" });
