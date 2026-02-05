@@ -204,8 +204,15 @@ app.post("/api/orders", (req, res) => {
     };
 
     createOrder(order);
+
+    // 🔍 DEBUG LOGS (VERY IMPORTANT)
+    console.log("✅ ORDER SAVED:", order.id);
+    console.log("📦 TOTAL ORDERS:", getOrders().length);
+    console.log("🧾 ORDER DATA:", order);
+
     res.json({ success: true, order });
-  } catch {
+  } catch (e) {
+    console.error("❌ ORDER SAVE FAILED", e);
     res.status(400).json({ error: "Failed to save order" });
   }
 });
