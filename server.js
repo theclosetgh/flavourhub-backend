@@ -12,6 +12,9 @@ dotenv.config();
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
+app.get("/", (req, res) => {
+  res.send("🚀 FlavourHub backend is live");
+});
 
 const PORT = process.env.PORT || 3000;
 
