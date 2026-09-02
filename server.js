@@ -5,13 +5,15 @@ import fs from "fs";
 import path from "path";
 import jwt from "jsonwebtoken";
 import multer from "multer";
-import { v2 as cloudinary } from "cloudinary";
+import crypto from "crypto";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { createOrder, getOrders } from "./orders.store.js";
 
 dotenv.config();
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
+
 app.get("/", (req, res) => {
   res.send("🚀 FlavourHub backend is live");
 });
@@ -57,10 +59,12 @@ app.get("/api/health", (req, res) => {
     hasPaystackKeys: !!process.env.PAYSTACK_SECRET_KEY && !!process.env.PAYSTACK_PUBLIC_KEY,
     hasAdminPassword: !!process.env.ADMIN_PASSWORD,
     hasJwtSecret: !!process.env.JWT_SECRET,
-    hasCloudinary:
-      !!process.env.CLOUDINARY_CLOUD_NAME &&
-      !!process.env.CLOUDINARY_API_KEY &&
-      !!process.env.CLOUDINARY_API_SECRET,
+    hasR2:
+      !!process.env.CLOUDFLARE_ACCOUNT_ID &&
+      !!process.env.R2_ACCESS_KEY_ID &&
+      !!process.env.R2_SECRET_ACCESS_KEY &&
+      !!process.env.R2_BUCKET_NAME &&
+      !!process.env.R2_PUBLIC_BASE_URL,
     allowedOrigins: ALLOWED_ORIGINS,
   });
 });
@@ -172,12 +176,9 @@ function writeMenu(menu) {
   return data;
 }
 
-/* =========================
-   UPGRADE: PUBLIC MENU SHAPE
-   - Keep /api/menu exactly as you already use in the shop:
-     {updatedAt, categories:[{name, items:[{..., image:""}]}]}
-   - Also add /api/menu/flat (optional) for debugging
-========================= */
+/* -------------------------
+   Public Menu
+------------------------- */
 app.get("/api/menu", (req, res) => res.json(readMenu()));
 
 app.get("/api/menu/flat", (req, res) => {
@@ -192,39 +193,6 @@ app.get("/api/menu/flat", (req, res) => {
 /* -------------------------
    Admin Auth (JWT)
 ------------------------- */
-/* -------------------------
-   Orders (PAID ORDERS ONLY)
-------------------------- */
-
-// CUSTOMER → Save paid order
-app.post("/api/orders", (req, res) => {
-  try {
-    const order = {
-      id: "ORD-" + Date.now(),
-      ...req.body,
-      status: "paid",
-      createdAt: new Date().toISOString()
-    };
-
-    createOrder(order);
-
-    // 🔍 DEBUG LOGS (VERY IMPORTANT)
-    console.log("✅ ORDER SAVED:", order.id);
-    console.log("📦 TOTAL ORDERS:", getOrders().length);
-    console.log("🧾 ORDER DATA:", order);
-
-    res.json({ success: true, order });
-  } catch (e) {
-    console.error("❌ ORDER SAVE FAILED", e);
-    res.status(400).json({ error: "Failed to save order" });
-  }
-});
-
-// ADMIN → View orders
-app.get("/api/orders/admin", requireAdmin, (req, res) => {
-  res.json(getOrders());
-});
-
 function signToken() {
   const secret = requireEnv("JWT_SECRET");
   return jwt.sign({ role: "admin" }, secret, { expiresIn: "12h" });
@@ -258,17 +226,12 @@ app.post("/api/admin/login", (req, res) => {
   }
 });
 
-/* =========================
-   UPGRADE: MENU SAVE
-   - Accept both:
-     1) {categories:[{name, items:[...]}]}   (your current admin format)
-     2) [{category:"Shawarma", items:[...]}] (alternate)
-========================= */
+/* -------------------------
+   Menu Save
+------------------------- */
 function coerceMenuBody(body) {
-  // Case 1: correct format
   if (body && Array.isArray(body.categories)) return body;
 
-  // Case 2: array of {category, items}
   if (Array.isArray(body)) {
     return {
       categories: body.map((c) => ({
@@ -278,7 +241,6 @@ function coerceMenuBody(body) {
     };
   }
 
-  // Case 3: {menu:{categories:[...]}}
   if (body?.menu && Array.isArray(body.menu.categories)) return body.menu;
 
   return null;
@@ -303,7 +265,6 @@ function sanitizeMenu(menu) {
       if (!it.name) throw new Error("Item name missing in: " + cat.name);
       if (!Number.isFinite(it.price) || it.price < 0) throw new Error("Invalid price for: " + it.name);
 
-      // If your admin accidentally sends img instead of image, keep it
       if (!it.image && it.img) it.image = (it.img ?? "").toString().trim();
     }
   }
@@ -325,21 +286,31 @@ app.put("/api/admin/menu", requireAdmin, (req, res) => {
 });
 
 /* -------------------------
-   Cloudinary Upload (Admin)
+   Cloudflare R2 Upload (Admin)
 ------------------------- */
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME || "",
-  api_key: process.env.CLOUDINARY_API_KEY || "",
-  api_secret: process.env.CLOUDINARY_API_SECRET || ""
-});
+function requireR2Env() {
+  const required = [
+    "CLOUDFLARE_ACCOUNT_ID",
+    "R2_ACCESS_KEY_ID",
+    "R2_SECRET_ACCESS_KEY",
+    "R2_BUCKET_NAME",
+    "R2_PUBLIC_BASE_URL"
+  ];
 
-function requireCloudinaryEnv() {
-  const missing = [];
-  for (const k of ["CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"]) {
-    if (!(process.env[k] || "").trim()) missing.push(k);
+  const missing = required.filter((k) => !(process.env[k] || "").trim());
+  if (missing.length) {
+    throw new Error("Missing R2 env vars: " + missing.join(", "));
   }
-  if (missing.length) throw new Error("Missing Cloudinary env vars: " + missing.join(", "));
 }
+
+const r2 = new S3Client({
+  region: "auto",
+  endpoint: `https://${process.env.CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
+  }
+});
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -352,29 +323,61 @@ const upload = multer({
 
 app.post("/api/admin/upload", requireAdmin, upload.single("image"), async (req, res) => {
   try {
-    requireCloudinaryEnv();
-    if (!req.file?.buffer) return res.status(400).json({ error: "No file uploaded" });
+    requireR2Env();
 
-    const folder = (process.env.CLOUDINARY_FOLDER || "flavourhub/menu").trim();
+    if (!req.file?.buffer) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
 
-    const result = await new Promise((resolve, reject) => {
-      const stream = cloudinary.uploader.upload_stream(
-        {
-          folder,
-          resource_type: "image",
-          transformation: [{ width: 1200, height: 1200, crop: "limit" }],
-          format: "webp"
-        },
-        (err, data) => (err ? reject(err) : resolve(data))
-      );
-      stream.end(req.file.buffer);
-    });
+    const ext = (req.file.originalname.split(".").pop() || "webp").toLowerCase();
+    const key = `menu/${crypto.randomUUID()}.${ext}`;
 
-    return res.json({ url: result.secure_url, public_id: result.public_id });
+    await r2.send(
+      new PutObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME,
+        Key: key,
+        Body: req.file.buffer,
+        ContentType: req.file.mimetype
+      })
+    );
+
+    const base = process.env.R2_PUBLIC_BASE_URL.replace(/\/+$/, "");
+    const url = `${base}/${key}`;
+
+    return res.json({ url, key });
   } catch (e) {
     console.error(e);
     return res.status(400).json({ error: e.message || "Upload failed" });
   }
+});
+
+/* -------------------------
+   Orders
+------------------------- */
+app.post("/api/orders", (req, res) => {
+  try {
+    const order = {
+      id: "ORD-" + Date.now(),
+      ...req.body,
+      status: "paid",
+      createdAt: new Date().toISOString()
+    };
+
+    createOrder(order);
+
+    console.log("✅ ORDER SAVED:", order.id);
+    console.log("📦 TOTAL ORDERS:", getOrders().length);
+    console.log("🧾 ORDER DATA:", order);
+
+    res.json({ success: true, order });
+  } catch (e) {
+    console.error("❌ ORDER SAVE FAILED", e);
+    res.status(400).json({ error: "Failed to save order" });
+  }
+});
+
+app.get("/api/orders/admin", requireAdmin, (req, res) => {
+  res.json(getOrders());
 });
 
 /* -------------------------
@@ -448,7 +451,5 @@ app.post("/api/paystack/initialize", handleInitialize);
 app.get("/api/paystack/verify/:reference", handleVerify);
 app.post("/paystack/initialize", handleInitialize);
 app.get("/paystack/verify/:reference", handleVerify);
-
-
 
 app.listen(PORT, () => console.log("Server running on port", PORT));
