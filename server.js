@@ -6,8 +6,17 @@ import path from "path";
 import jwt from "jsonwebtoken";
 import multer from "multer";
 import crypto from "crypto";
+import rateLimit from "express-rate-limit";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { createOrder, getOrders } from "./orders.store.js";
+import {
+  getDiscounts,
+  getDiscountById,
+  getDiscountByCode,
+  createDiscount,
+  updateDiscount,
+  deleteDiscount,
+} from "./discounts.store.js";
 
 dotenv.config();
 
@@ -36,7 +45,7 @@ app.use(
       if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
       return cb(new Error("CORS blocked: " + origin), false);
     },
-    methods: ["GET", "POST", "PUT", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
@@ -211,6 +220,25 @@ function requireAdmin(req, res, next) {
   }
 }
 
+/* -------------------------
+   Rate limiting
+------------------------- */
+const adminRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests, please try again later" },
+});
+
+const publicDiscountRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests, please try again later" },
+});
+
 app.post("/api/admin/login", (req, res) => {
   try {
     const adminPass = requireEnv("ADMIN_PASSWORD");
@@ -352,13 +380,216 @@ app.post("/api/admin/upload", requireAdmin, upload.single("image"), async (req, 
 });
 
 /* -------------------------
+   Discounts
+   NOTE: Persisted to discounts.json, same file-based
+   approach used for the menu.
+------------------------- */
+const DISCOUNT_TYPES = ["percentage", "fixed"];
+
+function sanitizeDiscountInput(body, { partial = false } = {}) {
+  const out = {};
+  const has = (k) => Object.prototype.hasOwnProperty.call(body || {}, k);
+
+  if (!partial || has("code")) {
+    const code = (body?.code ?? "").toString().trim().toUpperCase();
+    if (!code) throw new Error("Discount code is required");
+    out.code = code;
+  }
+
+  if (!partial || has("type")) {
+    const type = (body?.type ?? "").toString().trim().toLowerCase();
+    if (!DISCOUNT_TYPES.includes(type)) {
+      throw new Error(`Discount type must be one of: ${DISCOUNT_TYPES.join(", ")}`);
+    }
+    out.type = type;
+  }
+
+  if (!partial || has("value")) {
+    const value = Number(body?.value);
+    if (!Number.isFinite(value) || value <= 0) throw new Error("Discount value must be a positive number");
+    const type = out.type || body?.type;
+    if (type === "percentage" && value > 100) throw new Error("Percentage discount value cannot exceed 100");
+    out.value = value;
+  }
+
+  if (!partial || has("active")) {
+    out.active = body?.active === undefined ? true : !!body.active;
+  }
+
+  if (!partial || has("expiresAt")) {
+    const raw = body?.expiresAt;
+    if (raw === null || raw === undefined || raw === "") {
+      out.expiresAt = null;
+    } else {
+      const d = new Date(raw);
+      if (Number.isNaN(d.getTime())) throw new Error("Invalid expiresAt date");
+      out.expiresAt = d.toISOString();
+    }
+  }
+
+  if (!partial || has("minSubtotal")) {
+    const raw = body?.minSubtotal;
+    if (raw === null || raw === undefined || raw === "") {
+      out.minSubtotal = 0;
+    } else {
+      const min = Number(raw);
+      if (!Number.isFinite(min) || min < 0) throw new Error("minSubtotal must be a non-negative number");
+      out.minSubtotal = min;
+    }
+  }
+
+  if (!partial || has("description")) {
+    out.description = (body?.description ?? "").toString().trim();
+  }
+
+  return out;
+}
+
+function isDiscountUsable(discount) {
+  if (!discount) return { ok: false, reason: "Discount not found" };
+  if (!discount.active) return { ok: false, reason: "Discount is inactive" };
+  if (discount.expiresAt && new Date(discount.expiresAt).getTime() < Date.now()) {
+    return { ok: false, reason: "Discount has expired" };
+  }
+  return { ok: true };
+}
+
+function computeDiscount(discount, subtotal) {
+  const amount = discount.type === "percentage" ? (subtotal * discount.value) / 100 : discount.value;
+  const discountAmount = Math.min(Math.max(amount, 0), subtotal);
+  const total = Math.max(subtotal - discountAmount, 0);
+  return { discountAmount, total };
+}
+
+function resolveDiscountForSubtotal(code, subtotal) {
+  const sub = Number(subtotal);
+  if (!Number.isFinite(sub) || sub < 0) throw new Error("A valid subtotal is required");
+
+  const discount = getDiscountByCode(code);
+  const usable = isDiscountUsable(discount);
+  if (!usable.ok) throw new Error(usable.reason);
+
+  if (discount.minSubtotal && sub < discount.minSubtotal) {
+    throw new Error(`Subtotal must be at least ${discount.minSubtotal} to use this discount`);
+  }
+
+  const { discountAmount, total } = computeDiscount(discount, sub);
+  return {
+    code: discount.code,
+    type: discount.type,
+    value: discount.value,
+    subtotal: sub,
+    discountAmount,
+    total,
+  };
+}
+
+app.get("/api/discounts", publicDiscountRateLimit, (req, res) => {
+  const active = getDiscounts()
+    .filter((d) => isDiscountUsable(d).ok)
+    .map(({ id, code, type, value, expiresAt, minSubtotal, description }) => ({
+      id,
+      code,
+      type,
+      value,
+      expiresAt,
+      minSubtotal,
+      description,
+    }));
+  res.json({ discounts: active });
+});
+
+app.post("/api/discounts/validate", publicDiscountRateLimit, (req, res) => {
+  try {
+    const code = (req.body?.code || "").toString().trim();
+    if (!code) return res.status(400).json({ error: "Discount code is required" });
+
+    const result = resolveDiscountForSubtotal(code, req.body?.subtotal);
+    return res.json({ valid: true, ...result });
+  } catch (e) {
+    return res.status(400).json({ valid: false, error: e.message || "Invalid discount code" });
+  }
+});
+
+app.get("/api/admin/discounts", adminRateLimit, requireAdmin, (req, res) => {
+  res.json({ discounts: getDiscounts() });
+});
+
+app.post("/api/admin/discounts", adminRateLimit, requireAdmin, (req, res) => {
+  try {
+    const clean = sanitizeDiscountInput(req.body);
+    if (getDiscountByCode(clean.code)) {
+      return res.status(400).json({ error: "A discount with this code already exists" });
+    }
+    const created = createDiscount(clean);
+    return res.status(201).json(created);
+  } catch (e) {
+    return res.status(400).json({ error: e.message || "Invalid discount" });
+  }
+});
+
+app.put("/api/admin/discounts/:id", adminRateLimit, requireAdmin, (req, res) => {
+  try {
+    const existing = getDiscountById(req.params.id);
+    if (!existing) return res.status(404).json({ error: "Discount not found" });
+
+    const clean = sanitizeDiscountInput(req.body, { partial: true });
+    if (clean.code && clean.code !== existing.code && getDiscountByCode(clean.code)) {
+      return res.status(400).json({ error: "A discount with this code already exists" });
+    }
+
+    const updated = updateDiscount(req.params.id, clean);
+    return res.json(updated);
+  } catch (e) {
+    return res.status(400).json({ error: e.message || "Invalid discount" });
+  }
+});
+
+app.patch("/api/admin/discounts/:id/status", adminRateLimit, requireAdmin, (req, res) => {
+  try {
+    const existing = getDiscountById(req.params.id);
+    if (!existing) return res.status(404).json({ error: "Discount not found" });
+
+    if (typeof req.body?.active !== "boolean") {
+      return res.status(400).json({ error: "'active' boolean is required" });
+    }
+
+    const updated = updateDiscount(req.params.id, { active: req.body.active });
+    return res.json(updated);
+  } catch (e) {
+    return res.status(400).json({ error: e.message || "Failed to update discount status" });
+  }
+});
+
+app.delete("/api/admin/discounts/:id", adminRateLimit, requireAdmin, (req, res) => {
+  const existing = getDiscountById(req.params.id);
+  if (!existing) return res.status(404).json({ error: "Discount not found" });
+
+  deleteDiscount(req.params.id);
+  return res.json({ success: true });
+});
+
+/* -------------------------
    Orders
 ------------------------- */
 app.post("/api/orders", (req, res) => {
+  let discountInfo = null;
+  const discountCode = (req.body?.discountCode || "").toString().trim();
+
+  if (discountCode) {
+    try {
+      const subtotal = req.body?.subtotal ?? req.body?.amount;
+      discountInfo = resolveDiscountForSubtotal(discountCode, subtotal);
+    } catch (e) {
+      return res.status(400).json({ error: e.message || "Invalid discount code" });
+    }
+  }
+
   try {
     const order = {
       id: "ORD-" + Date.now(),
       ...req.body,
+      ...(discountInfo ? { discount: discountInfo } : {}),
       status: "paid",
       createdAt: new Date().toISOString()
     };
