@@ -6,20 +6,27 @@ const DISCOUNTS_FILE = path.join(process.cwd(), "discounts.json");
 
 function readDiscounts() {
   try {
-    const discounts = JSON.parse(fs.readFileSync(DISCOUNTS_FILE, "utf8"));
+    if (!fs.existsSync(DISCOUNTS_FILE)) {
+      writeDiscounts([]);
+      return [];
+    }
+
+    const data = JSON.parse(fs.readFileSync(DISCOUNTS_FILE, "utf8"));
+    const discounts = Array.isArray(data) ? data : data?.discounts;
     if (!Array.isArray(discounts)) throw new Error("Invalid discounts file");
     return discounts;
   } catch (error) {
-    if (!fs.existsSync(DISCOUNTS_FILE)) {
-      fs.writeFileSync(DISCOUNTS_FILE, "[]\n", "utf8");
-      return [];
-    }
+    if (!fs.existsSync(DISCOUNTS_FILE)) return [];
     throw error;
   }
 }
 
 function writeDiscounts(discounts) {
-  fs.writeFileSync(DISCOUNTS_FILE, JSON.stringify(discounts, null, 2) + "\n", "utf8");
+  fs.writeFileSync(
+    DISCOUNTS_FILE,
+    JSON.stringify({ updatedAt: new Date().toISOString(), discounts }, null, 2) + "\n",
+    "utf8"
+  );
   return discounts;
 }
 
@@ -57,6 +64,13 @@ function normalizeDiscount(input, existing = {}) {
   const active = data.active === undefined ? true : data.active;
   if (typeof active !== "boolean") throw new Error("Active must be a boolean");
 
+  const minSubtotal = data.minSubtotal === undefined || data.minSubtotal === null || data.minSubtotal === ""
+    ? 0
+    : Number(data.minSubtotal);
+  if (!Number.isFinite(minSubtotal) || minSubtotal < 0) {
+    throw new Error("Minimum subtotal must be a non-negative number");
+  }
+
   return {
     ...existing,
     id: existing.id || crypto.randomUUID(),
@@ -65,6 +79,8 @@ function normalizeDiscount(input, existing = {}) {
     value,
     active,
     expiresAt: normalizeExpiration(data.expiresAt),
+    minSubtotal,
+    description: String(data.description ?? "").trim(),
     createdAt: existing.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString()
   };
@@ -72,6 +88,16 @@ function normalizeDiscount(input, existing = {}) {
 
 export function getDiscounts() {
   return readDiscounts();
+}
+
+export function getDiscountById(id) {
+  return getDiscounts().find((discount) => discount.id === id) || null;
+}
+
+export function getDiscountByCode(codeInput) {
+  const code = String(codeInput ?? "").trim().toUpperCase();
+  if (!code) return null;
+  return getDiscounts().find((discount) => discount.code === code) || null;
 }
 
 export function createDiscount(input) {
@@ -114,11 +140,14 @@ export function calculateDiscount(codeInput, subtotalInput, now = new Date()) {
   const subtotal = Number(subtotalInput);
   if (!Number.isFinite(subtotal) || subtotal < 0) throw new Error("Subtotal must be a non-negative number");
 
-  const discount = readDiscounts().find((item) => item.code === code);
+  const discount = getDiscountByCode(code);
   if (!discount) throw new Error("Invalid discount code");
   if (!discount.active) throw new Error("This discount is inactive");
   if (discount.expiresAt && now.getTime() > new Date(discount.expiresAt).getTime()) {
     throw new Error("This discount has expired");
+  }
+  if (subtotal < (discount.minSubtotal || 0)) {
+    throw new Error(`Subtotal must be at least ${discount.minSubtotal} to use this discount`);
   }
 
   const round = (amount) => Math.round((amount + Number.EPSILON) * 100) / 100;

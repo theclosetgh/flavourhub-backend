@@ -44,7 +44,7 @@ app.use(
       if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
       return cb(new Error("CORS blocked: " + origin), false);
     },
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
@@ -221,10 +221,18 @@ function requireAdmin(req, res, next) {
 
 const limitDiscountAdminRequests = rateLimit({
   windowMs: 60_000,
-  limit: 120,
-  standardHeaders: "draft-7",
+  limit: 60,
+  standardHeaders: true,
   legacyHeaders: false,
-  message: { error: "Too many discount admin requests; try again shortly" }
+  message: { error: "Too many requests, please try again later" },
+});
+
+const publicDiscountRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests, please try again later" },
 });
 
 app.post("/api/admin/login", (req, res) => {
@@ -304,6 +312,22 @@ app.put("/api/admin/menu", requireAdmin, (req, res) => {
 /* -------------------------
    Admin Discounts
 ------------------------- */
+app.get("/api/discounts", publicDiscountRateLimit, (req, res) => {
+  const now = Date.now();
+  const discounts = getDiscounts()
+    .filter((discount) => discount.active && (!discount.expiresAt || new Date(discount.expiresAt).getTime() >= now))
+    .map(({ id, code, type, value, expiresAt, minSubtotal, description }) => ({
+      id,
+      code,
+      type,
+      value,
+      expiresAt,
+      minSubtotal,
+      description
+    }));
+  return res.json({ discounts });
+});
+
 app.get("/api/admin/discounts", limitDiscountAdminRequests, requireAdmin, (req, res) => {
   try {
     return res.json(getDiscounts());
@@ -352,7 +376,7 @@ app.delete("/api/admin/discounts/:id", limitDiscountAdminRequests, requireAdmin,
   }
 });
 
-app.post("/api/discounts/validate", (req, res) => {
+app.post("/api/discounts/validate", publicDiscountRateLimit, (req, res) => {
   try {
     const result = calculateDiscount(req.body?.code, req.body?.subtotal);
     return res.json({ valid: true, ...result });
@@ -361,6 +385,18 @@ app.post("/api/discounts/validate", (req, res) => {
   }
 });
 
+app.patch("/api/admin/discounts/:id/status", limitDiscountAdminRequests, requireAdmin, (req, res) => {
+  try {
+    if (typeof req.body?.active !== "boolean") {
+      return res.status(400).json({ error: "'active' boolean is required" });
+    }
+    const discount = updateDiscount(req.params.id, { active: req.body.active });
+    if (!discount) return res.status(404).json({ error: "Discount not found" });
+    return res.json(discount);
+  } catch (e) {
+    return res.status(400).json({ error: e.message || "Unable to update discount status" });
+  }
+});
 /* -------------------------
    Cloudflare R2 Upload (Admin)
 ------------------------- */
@@ -454,6 +490,7 @@ app.post("/api/orders", (req, res) => {
       discountAmount: discount ? discount.discountAmount : 0,
       total,
       finalTotal: total,
+      ...(discount ? { discount } : {}),
       status: "paid",
       createdAt: new Date().toISOString()
     };
