@@ -218,6 +218,29 @@ function requireAdmin(req, res, next) {
   }
 }
 
+const discountAdminRequests = new Map();
+function limitDiscountAdminRequests(req, res, next) {
+  const now = Date.now();
+  const client = req.ip || req.socket.remoteAddress || "unknown";
+  let bucket = discountAdminRequests.get(client);
+
+  if (!bucket || bucket.resetAt <= now) {
+    if (!bucket && discountAdminRequests.size >= 1000) {
+      discountAdminRequests.delete(discountAdminRequests.keys().next().value);
+    }
+    bucket = { count: 0, resetAt: now + 60_000 };
+    discountAdminRequests.set(client, bucket);
+  }
+
+  if (bucket.count >= 120) {
+    res.set("Retry-After", Math.ceil((bucket.resetAt - now) / 1000).toString());
+    return res.status(429).json({ error: "Too many discount admin requests; try again shortly" });
+  }
+
+  bucket.count += 1;
+  return next();
+}
+
 app.post("/api/admin/login", (req, res) => {
   try {
     const adminPass = requireEnv("ADMIN_PASSWORD");
@@ -295,7 +318,7 @@ app.put("/api/admin/menu", requireAdmin, (req, res) => {
 /* -------------------------
    Admin Discounts
 ------------------------- */
-app.get("/api/admin/discounts", requireAdmin, (req, res) => {
+app.get("/api/admin/discounts", limitDiscountAdminRequests, requireAdmin, (req, res) => {
   try {
     return res.json(getDiscounts());
   } catch {
@@ -303,7 +326,7 @@ app.get("/api/admin/discounts", requireAdmin, (req, res) => {
   }
 });
 
-app.post("/api/admin/discounts", requireAdmin, (req, res) => {
+app.post("/api/admin/discounts", limitDiscountAdminRequests, requireAdmin, (req, res) => {
   try {
     return res.status(201).json(createDiscount(req.body || {}));
   } catch (e) {
@@ -311,7 +334,7 @@ app.post("/api/admin/discounts", requireAdmin, (req, res) => {
   }
 });
 
-app.put("/api/admin/discounts/:id", requireAdmin, (req, res) => {
+app.put("/api/admin/discounts/:id", limitDiscountAdminRequests, requireAdmin, (req, res) => {
   try {
     const discount = updateDiscount(req.params.id, req.body || {});
     if (!discount) return res.status(404).json({ error: "Discount not found" });
@@ -321,7 +344,7 @@ app.put("/api/admin/discounts/:id", requireAdmin, (req, res) => {
   }
 });
 
-app.put("/api/admin/discounts/:id/status", requireAdmin, (req, res) => {
+app.put("/api/admin/discounts/:id/status", limitDiscountAdminRequests, requireAdmin, (req, res) => {
   try {
     if (typeof req.body?.active !== "boolean") {
       return res.status(400).json({ error: "Active must be a boolean" });
@@ -334,7 +357,7 @@ app.put("/api/admin/discounts/:id/status", requireAdmin, (req, res) => {
   }
 });
 
-app.delete("/api/admin/discounts/:id", requireAdmin, (req, res) => {
+app.delete("/api/admin/discounts/:id", limitDiscountAdminRequests, requireAdmin, (req, res) => {
   try {
     if (!deleteDiscount(req.params.id)) return res.status(404).json({ error: "Discount not found" });
     return res.json({ success: true });
