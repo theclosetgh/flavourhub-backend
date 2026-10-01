@@ -8,7 +8,6 @@ import multer from "multer";
 import crypto from "crypto";
 import { rateLimit } from "express-rate-limit";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import { Pool } from "pg";
 import { createOrder, getOrders } from "./orders.store.js";
 
 dotenv.config();
@@ -20,7 +19,28 @@ app.get("/", (req, res) => {
   res.send("🚀 FlavourHub backend is live");
 });
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT = process.env.PORT || 3000;
+
+/* -------------------------
+   CORS
+------------------------- */
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin: function (origin, cb) {
+      if (!origin) return cb(null, true);
+      if (ALLOWED_ORIGINS.length === 0) return cb(null, true);
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error("CORS blocked: " + origin), false);
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
 
 /* -------------------------
    Helpers
@@ -32,29 +52,21 @@ function requireEnv(name) {
 }
 
 /* -------------------------
-   PostgreSQL (Discounts)
+   Supabase REST (Discounts)
 ------------------------- */
-const DATABASE_URL = requireEnv("DATABASE_URL");
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: process.env.PGSSL === "false" ? false : { rejectUnauthorized: false },
-});
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
-async function initDb() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS discounts (
-      id UUID PRIMARY KEY,
-      code TEXT NOT NULL UNIQUE,
-      type TEXT NOT NULL CHECK (type IN ('percentage', 'fixed')),
-      value NUMERIC(12,2) NOT NULL CHECK (value > 0),
-      active BOOLEAN NOT NULL DEFAULT true,
-      expires_at TIMESTAMPTZ NULL,
-      min_subtotal NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (min_subtotal >= 0),
-      description TEXT NOT NULL DEFAULT '',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-  `);
+function hasSupabaseRest() {
+  return !!SUPABASE_URL && !!SUPABASE_SERVICE_ROLE_KEY;
+}
+
+function sbHeaders() {
+  return {
+    apikey: SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
 }
 
 function mapDiscountRow(row) {
@@ -64,11 +76,11 @@ function mapDiscountRow(row) {
     type: row.type,
     value: Number(row.value),
     active: !!row.active,
-    expiresAt: row.expires_at ? new Date(row.expires_at).toISOString() : null,
+    expiresAt: row.expires_at || null,
     minSubtotal: Number(row.min_subtotal || 0),
     description: row.description || "",
-    createdAt: row.created_at ? new Date(row.created_at).toISOString() : null,
-    updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
   };
 }
 
@@ -111,11 +123,11 @@ function sanitizeDiscountInput(body, { partial = false } = {}) {
   if (!partial || has("expiresAt")) {
     const raw = body?.expiresAt;
     if (raw === undefined || raw === null || raw === "") {
-      out.expiresAt = null;
+      out.expires_at = null;
     } else {
       const d = new Date(raw);
       if (!Number.isFinite(d.getTime())) throw new Error("Invalid expiration date");
-      out.expiresAt = d.toISOString();
+      out.expires_at = d.toISOString();
     }
   }
 
@@ -125,7 +137,7 @@ function sanitizeDiscountInput(body, { partial = false } = {}) {
     if (!Number.isFinite(minSubtotal) || minSubtotal < 0) {
       throw new Error("Minimum subtotal must be a non-negative number");
     }
-    out.minSubtotal = Number(minSubtotal.toFixed(2));
+    out.min_subtotal = Number(minSubtotal.toFixed(2));
   }
 
   if (!partial || has("description")) {
@@ -135,99 +147,113 @@ function sanitizeDiscountInput(body, { partial = false } = {}) {
   return out;
 }
 
+async function sbRequest(pathname, { method = "GET", body = null } = {}) {
+  if (!hasSupabaseRest()) {
+    throw new Error("Supabase REST env not configured");
+  }
+
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/${pathname}`, {
+    method,
+    headers: sbHeaders(),
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  const text = await r.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+
+  if (!r.ok) {
+    const msg = data?.message || data?.error || text || "Supabase request failed";
+    throw new Error(msg);
+  }
+
+  return data;
+}
+
 async function getDiscounts() {
-  const { rows } = await pool.query(`SELECT * FROM discounts ORDER BY created_at DESC`);
-  return rows.map(mapDiscountRow);
+  const rows = await sbRequest(
+    `discounts?select=*&order=created_at.desc`
+  );
+  return (rows || []).map(mapDiscountRow);
 }
 
 async function getDiscountById(id) {
-  const { rows } = await pool.query(`SELECT * FROM discounts WHERE id = $1 LIMIT 1`, [id]);
-  return rows[0] ? mapDiscountRow(rows[0]) : null;
+  const rows = await sbRequest(
+    `discounts?select=*&id=eq.${encodeURIComponent(id)}&limit=1`
+  );
+  return rows?.[0] ? mapDiscountRow(rows[0]) : null;
 }
 
 async function getDiscountByCode(codeInput) {
   const code = String(codeInput ?? "").trim().toUpperCase();
   if (!code) return null;
-  const { rows } = await pool.query(`SELECT * FROM discounts WHERE code = $1 LIMIT 1`, [code]);
-  return rows[0] ? mapDiscountRow(rows[0]) : null;
+  const rows = await sbRequest(
+    `discounts?select=*&code=eq.${encodeURIComponent(code)}&limit=1`
+  );
+  return rows?.[0] ? mapDiscountRow(rows[0]) : null;
 }
 
 async function createDiscount(input) {
   const clean = sanitizeDiscountInput(input, { partial: false });
-  const id = crypto.randomUUID();
+  const row = {
+    id: crypto.randomUUID(),
+    code: clean.code,
+    type: clean.type,
+    value: clean.value,
+    active: clean.active ?? true,
+    expires_at: clean.expires_at ?? null,
+    min_subtotal: clean.min_subtotal ?? 0,
+    description: clean.description ?? "",
+  };
 
-  try {
-    const { rows } = await pool.query(
-      `
-      INSERT INTO discounts (id, code, type, value, active, expires_at, min_subtotal, description, created_at, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now(), now())
-      RETURNING *;
-      `,
-      [
-        id,
-        clean.code,
-        clean.type,
-        clean.value,
-        clean.active ?? true,
-        clean.expiresAt,
-        clean.minSubtotal ?? 0,
-        clean.description ?? "",
-      ]
-    );
-    return mapDiscountRow(rows[0]);
-  } catch (e) {
-    if (String(e?.message || "").includes("duplicate key")) {
-      throw new Error("A discount with this code already exists");
-    }
-    throw e;
-  }
+  const rows = await sbRequest(`discounts`, {
+    method: "POST",
+    body: row,
+  });
+
+  if (Array.isArray(rows) && rows[0]) return mapDiscountRow(rows[0]);
+
+  const created = await getDiscountById(row.id);
+  if (!created) throw new Error("Failed to create discount");
+  return created;
 }
 
 async function updateDiscount(id, input) {
   const existing = await getDiscountById(id);
   if (!existing) return null;
 
-  const mergedInput = { ...existing, ...input };
-  const clean = sanitizeDiscountInput(mergedInput, { partial: false });
+  const merged = { ...existing, ...input };
+  const clean = sanitizeDiscountInput(merged, { partial: false });
 
-  try {
-    const { rows } = await pool.query(
-      `
-      UPDATE discounts
-      SET code = $2,
-          type = $3,
-          value = $4,
-          active = $5,
-          expires_at = $6,
-          min_subtotal = $7,
-          description = $8,
-          updated_at = now()
-      WHERE id = $1
-      RETURNING *;
-      `,
-      [
-        id,
-        clean.code,
-        clean.type,
-        clean.value,
-        clean.active ?? true,
-        clean.expiresAt,
-        clean.minSubtotal ?? 0,
-        clean.description ?? "",
-      ]
-    );
-    return rows[0] ? mapDiscountRow(rows[0]) : null;
-  } catch (e) {
-    if (String(e?.message || "").includes("duplicate key")) {
-      throw new Error("A discount with this code already exists");
+  await sbRequest(
+    `discounts?id=eq.${encodeURIComponent(id)}`,
+    {
+      method: "PATCH",
+      body: {
+        code: clean.code,
+        type: clean.type,
+        value: clean.value,
+        active: clean.active ?? true,
+        expires_at: clean.expires_at ?? null,
+        min_subtotal: clean.min_subtotal ?? 0,
+        description: clean.description ?? "",
+        updated_at: new Date().toISOString(),
+      },
     }
-    throw e;
-  }
+  );
+
+  return await getDiscountById(id);
 }
 
 async function deleteDiscount(id) {
-  const r = await pool.query(`DELETE FROM discounts WHERE id = $1`, [id]);
-  return r.rowCount > 0;
+  await sbRequest(`discounts?id=eq.${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  return true;
 }
 
 function isDiscountUsable(discount) {
@@ -279,41 +305,22 @@ async function resolveDiscountForSubtotal(code, subtotal) {
 }
 
 /* -------------------------
-   CORS
-------------------------- */
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-app.use(
-  cors({
-    origin: function (origin, cb) {
-      if (!origin) return cb(null, true);
-      if (ALLOWED_ORIGINS.length === 0) return cb(null, true);
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error("CORS blocked: " + origin), false);
-    },
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
-
-/* -------------------------
    Health
 ------------------------- */
 app.get("/api/health", async (req, res) => {
-  let dbOk = false;
+  let supabaseRestOk = false;
+
   try {
-    await pool.query("SELECT 1");
-    dbOk = true;
+    if (hasSupabaseRest()) {
+      await sbRequest("discounts?select=id&limit=1");
+      supabaseRestOk = true;
+    }
   } catch {
-    dbOk = false;
+    supabaseRestOk = false;
   }
 
   res.json({
     ok: true,
-    dbOk,
     hasPaystackKeys: !!process.env.PAYSTACK_SECRET_KEY && !!process.env.PAYSTACK_PUBLIC_KEY,
     hasAdminPassword: !!process.env.ADMIN_PASSWORD,
     hasJwtSecret: !!process.env.JWT_SECRET,
@@ -323,6 +330,8 @@ app.get("/api/health", async (req, res) => {
       !!process.env.R2_SECRET_ACCESS_KEY &&
       !!process.env.R2_BUCKET_NAME &&
       !!process.env.R2_PUBLIC_BASE_URL,
+    hasSupabaseRest,
+    supabaseRestOk,
     allowedOrigins: ALLOWED_ORIGINS,
   });
 });
@@ -333,7 +342,20 @@ app.get("/api/health", async (req, res) => {
 const DATA_FILE = path.join(process.cwd(), "menu.json");
 
 function defaultMenu() {
-  return { updatedAt: new Date().toISOString(), categories: [] };
+  return {
+    updatedAt: new Date().toISOString(),
+    categories: [
+      {
+        name: "Shawarma",
+        items: [
+          { id: "shaw1", name: "Sizzling Shawarma (Chicken)", price: 50, desc: "Classic chicken shawarma.", image: "" },
+          { id: "shaw2", name: "Minced with Flavour (Minced Meat)", price: 60, desc: "Minced meat shawarma with signature flavour.", image: "" },
+          { id: "shaw3", name: "Flavor Twist (Shredded Beef)", price: 80, desc: "Shredded beef shawarma.", image: "" },
+          { id: "shaw4", name: "Flavor Twist (Shredded Beef & Chicken)", price: 90, desc: "Mixed shredded beef and chicken.", image: "" }
+        ]
+      }
+    ]
+  };
 }
 
 function readMenu() {
@@ -484,13 +506,14 @@ app.put("/api/admin/menu", requireAdmin, (req, res) => {
 });
 
 /* -------------------------
-   Discounts (Postgres-backed)
+   Discounts (Supabase REST)
 ------------------------- */
 app.get("/api/discounts", publicDiscountRateLimit, async (req, res) => {
   try {
     const discounts = await getDiscounts();
+    const now = Date.now();
     const active = discounts
-      .filter((d) => isDiscountUsable(d).ok)
+      .filter((discount) => discount.active && (!discount.expiresAt || new Date(discount.expiresAt).getTime() >= now))
       .map(({ id, code, type, value, expiresAt, minSubtotal, description }) => ({
         id,
         code,
@@ -498,26 +521,25 @@ app.get("/api/discounts", publicDiscountRateLimit, async (req, res) => {
         value,
         expiresAt,
         minSubtotal,
-        description,
+        description
       }));
     return res.json({ discounts: active });
-  } catch {
-    return res.status(500).json({ error: "Unable to load discounts" });
+  } catch (e) {
+    return res.status(500).json({ error: e.message || "Unable to load discounts" });
   }
 });
 
 app.get("/api/admin/discounts", limitDiscountAdminRequests, requireAdmin, async (req, res) => {
   try {
-    return res.json({ discounts: await getDiscounts() });
-  } catch {
-    return res.status(500).json({ error: "Unable to load discounts" });
+    return res.json(await getDiscounts());
+  } catch (e) {
+    return res.status(500).json({ error: e.message || "Unable to load discounts" });
   }
 });
 
 app.post("/api/admin/discounts", limitDiscountAdminRequests, requireAdmin, async (req, res) => {
   try {
-    const created = await createDiscount(req.body || {});
-    return res.status(201).json(created);
+    return res.status(201).json(await createDiscount(req.body || {}));
   } catch (e) {
     return res.status(400).json({ error: e.message || "Invalid discount" });
   }
@@ -530,6 +552,37 @@ app.put("/api/admin/discounts/:id", limitDiscountAdminRequests, requireAdmin, as
     return res.json(discount);
   } catch (e) {
     return res.status(400).json({ error: e.message || "Invalid discount" });
+  }
+});
+
+app.put("/api/admin/discounts/:id/status", limitDiscountAdminRequests, requireAdmin, async (req, res) => {
+  try {
+    if (typeof req.body?.active !== "boolean") {
+      return res.status(400).json({ error: "Active must be a boolean" });
+    }
+    const discount = await updateDiscount(req.params.id, { active: req.body.active });
+    if (!discount) return res.status(404).json({ error: "Discount not found" });
+    return res.json(discount);
+  } catch (e) {
+    return res.status(400).json({ error: e.message || "Unable to update discount status" });
+  }
+});
+
+app.delete("/api/admin/discounts/:id", limitDiscountAdminRequests, requireAdmin, async (req, res) => {
+  try {
+    await deleteDiscount(req.params.id);
+    return res.json({ success: true });
+  } catch (e) {
+    return res.status(500).json({ error: e.message || "Unable to delete discount" });
+  }
+});
+
+app.post("/api/discounts/validate", publicDiscountRateLimit, async (req, res) => {
+  try {
+    const result = await resolveDiscountForSubtotal(req.body?.code, req.body?.subtotal);
+    return res.json({ valid: true, ...result });
+  } catch (e) {
+    return res.status(400).json({ valid: false, error: e.message || "Invalid discount" });
   }
 });
 
@@ -546,27 +599,6 @@ app.patch("/api/admin/discounts/:id/status", limitDiscountAdminRequests, require
   }
 });
 
-app.delete("/api/admin/discounts/:id", limitDiscountAdminRequests, requireAdmin, async (req, res) => {
-  try {
-    if (!(await deleteDiscount(req.params.id))) return res.status(404).json({ error: "Discount not found" });
-    return res.json({ success: true });
-  } catch {
-    return res.status(500).json({ error: "Unable to delete discount" });
-  }
-});
-
-app.post("/api/discounts/validate", publicDiscountRateLimit, async (req, res) => {
-  try {
-    const code = (req.body?.code || "").toString().trim();
-    if (!code) return res.status(400).json({ valid: false, error: "Discount code is required" });
-
-    const result = await resolveDiscountForSubtotal(code, req.body?.subtotal);
-    return res.json({ valid: true, ...result });
-  } catch (e) {
-    return res.status(400).json({ valid: false, error: e.message || "Invalid discount" });
-  }
-});
-
 /* -------------------------
    Cloudflare R2 Upload (Admin)
 ------------------------- */
@@ -576,7 +608,7 @@ function requireR2Env() {
     "R2_ACCESS_KEY_ID",
     "R2_SECRET_ACCESS_KEY",
     "R2_BUCKET_NAME",
-    "R2_PUBLIC_BASE_URL",
+    "R2_PUBLIC_BASE_URL"
   ];
 
   const missing = required.filter((k) => !(process.env[k] || "").trim());
@@ -590,8 +622,8 @@ const r2 = new S3Client({
   endpoint: `https://${process.env.CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com`,
   credentials: {
     accessKeyId: process.env.R2_ACCESS_KEY_ID,
-    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
-  },
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
+  }
 });
 
 const upload = multer({
@@ -600,7 +632,7 @@ const upload = multer({
   fileFilter: (req, file, cb) => {
     const ok = /^image\/(jpeg|png|webp)$/i.test(file.mimetype || "");
     cb(ok ? null : new Error("Only JPG/PNG/WebP allowed"), ok);
-  },
+  }
 });
 
 app.post("/api/admin/upload", requireAdmin, upload.single("image"), async (req, res) => {
@@ -619,7 +651,7 @@ app.post("/api/admin/upload", requireAdmin, upload.single("image"), async (req, 
         Bucket: process.env.R2_BUCKET_NAME,
         Key: key,
         Body: req.file.buffer,
-        ContentType: req.file.mimetype,
+        ContentType: req.file.mimetype
       })
     );
 
@@ -662,7 +694,7 @@ app.post("/api/orders", async (req, res) => {
       finalTotal: total,
       ...(discount ? { discount } : {}),
       status: "paid",
-      createdAt: new Date().toISOString(),
+      createdAt: new Date().toISOString()
     };
 
     createOrder(order);
@@ -693,9 +725,9 @@ async function paystackInitialize({ email, amount, currency }) {
     method: "POST",
     headers: {
       Authorization: `Bearer ${secret}`,
-      "Content-Type": "application/json",
+      "Content-Type": "application/json"
     },
-    body: JSON.stringify({ email, amount, currency: currency || "GHS" }),
+    body: JSON.stringify({ email, amount, currency: currency || "GHS" })
   });
 
   const data = await r.json().catch(() => ({}));
@@ -754,18 +786,4 @@ app.get("/api/paystack/verify/:reference", handleVerify);
 app.post("/paystack/initialize", handleInitialize);
 app.get("/paystack/verify/:reference", handleVerify);
 
-/* -------------------------
-   Bootstrap
-------------------------- */
-async function start() {
-  try {
-    await initDb();
-    await pool.query("SELECT 1");
-    app.listen(PORT, () => console.log("Server running on port", PORT));
-  } catch (e) {
-    console.error("❌ Failed to start server:", e);
-    process.exit(1);
-  }
-}
-
-start();
+app.listen(PORT, () => console.log("Server running on port", PORT));
