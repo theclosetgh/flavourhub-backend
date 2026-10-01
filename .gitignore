@@ -1,0 +1,4 @@
+node_modules/
+menu.json
+discounts.json
+.env
