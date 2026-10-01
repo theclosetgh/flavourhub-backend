@@ -8,6 +8,13 @@ import multer from "multer";
 import crypto from "crypto";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { createOrder, getOrders } from "./orders.store.js";
+import {
+  calculateDiscount,
+  createDiscount,
+  deleteDiscount,
+  getDiscounts,
+  updateDiscount
+} from "./discounts.store.js";
 
 dotenv.config();
 
@@ -36,7 +43,7 @@ app.use(
       if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
       return cb(new Error("CORS blocked: " + origin), false);
     },
-    methods: ["GET", "POST", "PUT", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
@@ -286,6 +293,66 @@ app.put("/api/admin/menu", requireAdmin, (req, res) => {
 });
 
 /* -------------------------
+   Admin Discounts
+------------------------- */
+app.get("/api/admin/discounts", requireAdmin, (req, res) => {
+  try {
+    return res.json(getDiscounts());
+  } catch {
+    return res.status(500).json({ error: "Unable to load discounts" });
+  }
+});
+
+app.post("/api/admin/discounts", requireAdmin, (req, res) => {
+  try {
+    return res.status(201).json(createDiscount(req.body || {}));
+  } catch (e) {
+    return res.status(400).json({ error: e.message || "Invalid discount" });
+  }
+});
+
+app.put("/api/admin/discounts/:id", requireAdmin, (req, res) => {
+  try {
+    const discount = updateDiscount(req.params.id, req.body || {});
+    if (!discount) return res.status(404).json({ error: "Discount not found" });
+    return res.json(discount);
+  } catch (e) {
+    return res.status(400).json({ error: e.message || "Invalid discount" });
+  }
+});
+
+app.put("/api/admin/discounts/:id/status", requireAdmin, (req, res) => {
+  try {
+    if (typeof req.body?.active !== "boolean") {
+      return res.status(400).json({ error: "Active must be a boolean" });
+    }
+    const discount = updateDiscount(req.params.id, { active: req.body.active });
+    if (!discount) return res.status(404).json({ error: "Discount not found" });
+    return res.json(discount);
+  } catch (e) {
+    return res.status(400).json({ error: e.message || "Unable to update discount status" });
+  }
+});
+
+app.delete("/api/admin/discounts/:id", requireAdmin, (req, res) => {
+  try {
+    if (!deleteDiscount(req.params.id)) return res.status(404).json({ error: "Discount not found" });
+    return res.json({ success: true });
+  } catch {
+    return res.status(500).json({ error: "Unable to delete discount" });
+  }
+});
+
+app.post("/api/discounts/validate", (req, res) => {
+  try {
+    const result = calculateDiscount(req.body?.code, req.body?.subtotal);
+    return res.json({ valid: true, ...result });
+  } catch (e) {
+    return res.status(400).json({ valid: false, error: e.message || "Invalid discount" });
+  }
+});
+
+/* -------------------------
    Cloudflare R2 Upload (Admin)
 ------------------------- */
 function requireR2Env() {
@@ -356,9 +423,28 @@ app.post("/api/admin/upload", requireAdmin, upload.single("image"), async (req, 
 ------------------------- */
 app.post("/api/orders", (req, res) => {
   try {
+    const body = req.body || {};
+    const discountCode = String(body.discountCode ?? "").trim();
+    const subtotalInput = body.subtotal ?? (discountCode ? undefined : body.total ?? body.amount ?? 0);
+    const subtotal = Number(subtotalInput);
+    if (!Number.isFinite(subtotal) || subtotal < 0) {
+      return res.status(400).json({ error: "Subtotal must be a non-negative number" });
+    }
+
+    const discount = discountCode ? calculateDiscount(discountCode, subtotal) : null;
+    const total = discount ? discount.total : Number(body.total ?? subtotal);
+    if (!Number.isFinite(total) || total < 0) {
+      return res.status(400).json({ error: "Total must be a non-negative number" });
+    }
+
     const order = {
-      id: "ORD-" + Date.now(),
-      ...req.body,
+      ...body,
+      id: body.id || "ORD-" + Date.now(),
+      subtotal,
+      discountCode: discount ? discount.code : null,
+      discountAmount: discount ? discount.discountAmount : 0,
+      total,
+      finalTotal: total,
       status: "paid",
       createdAt: new Date().toISOString()
     };
