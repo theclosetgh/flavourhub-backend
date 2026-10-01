@@ -15,11 +15,11 @@ dotenv.config();
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
   res.send("🚀 FlavourHub backend is live");
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 
 /* -------------------------
    CORS
@@ -66,6 +66,7 @@ function sbHeaders() {
     apikey: SUPABASE_SERVICE_ROLE_KEY,
     Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
     "Content-Type": "application/json",
+    Prefer: "return=representation",
   };
 }
 
@@ -147,14 +148,12 @@ function sanitizeDiscountInput(body, { partial = false } = {}) {
   return out;
 }
 
-async function sbRequest(pathname, { method = "GET", body = null } = {}) {
-  if (!hasSupabaseRest()) {
-    throw new Error("Supabase REST env not configured");
-  }
+async function sbRequest(pathname, { method = "GET", body = null, headers = {} } = {}) {
+  if (!hasSupabaseRest()) throw new Error("Supabase REST env not configured");
 
   const r = await fetch(`${SUPABASE_URL}/rest/v1/${pathname}`, {
     method,
-    headers: sbHeaders(),
+    headers: { ...sbHeaders(), ...headers },
     body: body ? JSON.stringify(body) : undefined,
   });
 
@@ -170,30 +169,23 @@ async function sbRequest(pathname, { method = "GET", body = null } = {}) {
     const msg = data?.message || data?.error || text || "Supabase request failed";
     throw new Error(msg);
   }
-
   return data;
 }
 
 async function getDiscounts() {
-  const rows = await sbRequest(
-    `discounts?select=*&order=created_at.desc`
-  );
+  const rows = await sbRequest(`discounts?select=*&order=created_at.desc`);
   return (rows || []).map(mapDiscountRow);
 }
 
 async function getDiscountById(id) {
-  const rows = await sbRequest(
-    `discounts?select=*&id=eq.${encodeURIComponent(id)}&limit=1`
-  );
+  const rows = await sbRequest(`discounts?select=*&id=eq.${encodeURIComponent(id)}&limit=1`);
   return rows?.[0] ? mapDiscountRow(rows[0]) : null;
 }
 
 async function getDiscountByCode(codeInput) {
   const code = String(codeInput ?? "").trim().toUpperCase();
   if (!code) return null;
-  const rows = await sbRequest(
-    `discounts?select=*&code=eq.${encodeURIComponent(code)}&limit=1`
-  );
+  const rows = await sbRequest(`discounts?select=*&code=eq.${encodeURIComponent(code)}&limit=1`);
   return rows?.[0] ? mapDiscountRow(rows[0]) : null;
 }
 
@@ -210,16 +202,19 @@ async function createDiscount(input) {
     description: clean.description ?? "",
   };
 
-  const rows = await sbRequest(`discounts`, {
-    method: "POST",
-    body: row,
-  });
-
-  if (Array.isArray(rows) && rows[0]) return mapDiscountRow(rows[0]);
-
-  const created = await getDiscountById(row.id);
-  if (!created) throw new Error("Failed to create discount");
-  return created;
+  try {
+    const rows = await sbRequest(`discounts`, { method: "POST", body: row });
+    if (Array.isArray(rows) && rows[0]) return mapDiscountRow(rows[0]);
+    const created = await getDiscountById(row.id);
+    if (!created) throw new Error("Failed to create discount");
+    return created;
+  } catch (e) {
+    const msg = String(e?.message || "");
+    if (msg.toLowerCase().includes("duplicate") || msg.toLowerCase().includes("unique")) {
+      throw new Error("A discount with this code already exists");
+    }
+    throw e;
+  }
 }
 
 async function updateDiscount(id, input) {
@@ -229,9 +224,8 @@ async function updateDiscount(id, input) {
   const merged = { ...existing, ...input };
   const clean = sanitizeDiscountInput(merged, { partial: false });
 
-  await sbRequest(
-    `discounts?id=eq.${encodeURIComponent(id)}`,
-    {
+  try {
+    await sbRequest(`discounts?id=eq.${encodeURIComponent(id)}`, {
       method: "PATCH",
       body: {
         code: clean.code,
@@ -243,15 +237,21 @@ async function updateDiscount(id, input) {
         description: clean.description ?? "",
         updated_at: new Date().toISOString(),
       },
+    });
+    return await getDiscountById(id);
+  } catch (e) {
+    const msg = String(e?.message || "");
+    if (msg.toLowerCase().includes("duplicate") || msg.toLowerCase().includes("unique")) {
+      throw new Error("A discount with this code already exists");
     }
-  );
-
-  return await getDiscountById(id);
+    throw e;
+  }
 }
 
 async function deleteDiscount(id) {
   await sbRequest(`discounts?id=eq.${encodeURIComponent(id)}`, {
     method: "DELETE",
+    headers: { Prefer: "return=minimal" },
   });
   return true;
 }
@@ -274,7 +274,6 @@ function computeDiscount(discount, subtotal) {
   const discountAmount = Math.min(Math.max(amount, 0), subtotal);
   const total = Math.max(subtotal - discountAmount, 0);
   const round = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
-
   return { discountAmount: round(discountAmount), total: round(total) };
 }
 
@@ -291,7 +290,6 @@ async function resolveDiscountForSubtotal(code, subtotal) {
   }
 
   const { discountAmount, total } = computeDiscount(discount, sub);
-
   return {
     id: discount.id,
     code: discount.code,
@@ -307,9 +305,8 @@ async function resolveDiscountForSubtotal(code, subtotal) {
 /* -------------------------
    Health
 ------------------------- */
-app.get("/api/health", async (req, res) => {
+app.get("/api/health", async (_req, res) => {
   let supabaseRestOk = false;
-
   try {
     if (hasSupabaseRest()) {
       await sbRequest("discounts?select=id&limit=1");
@@ -330,7 +327,7 @@ app.get("/api/health", async (req, res) => {
       !!process.env.R2_SECRET_ACCESS_KEY &&
       !!process.env.R2_BUCKET_NAME &&
       !!process.env.R2_PUBLIC_BASE_URL,
-    hasSupabaseRest,
+    hasSupabaseRest: hasSupabaseRest(),
     supabaseRestOk,
     allowedOrigins: ALLOWED_ORIGINS,
   });
@@ -351,10 +348,10 @@ function defaultMenu() {
           { id: "shaw1", name: "Sizzling Shawarma (Chicken)", price: 50, desc: "Classic chicken shawarma.", image: "" },
           { id: "shaw2", name: "Minced with Flavour (Minced Meat)", price: 60, desc: "Minced meat shawarma with signature flavour.", image: "" },
           { id: "shaw3", name: "Flavor Twist (Shredded Beef)", price: 80, desc: "Shredded beef shawarma.", image: "" },
-          { id: "shaw4", name: "Flavor Twist (Shredded Beef & Chicken)", price: 90, desc: "Mixed shredded beef and chicken.", image: "" }
-        ]
-      }
-    ]
+          { id: "shaw4", name: "Flavor Twist (Shredded Beef & Chicken)", price: 90, desc: "Mixed shredded beef and chicken.", image: "" },
+        ],
+      },
+    ],
   };
 }
 
@@ -365,8 +362,7 @@ function readMenu() {
       fs.writeFileSync(DATA_FILE, JSON.stringify(d, null, 2), "utf8");
       return d;
     }
-    const raw = fs.readFileSync(DATA_FILE, "utf8");
-    return JSON.parse(raw);
+    return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
   } catch {
     const d = defaultMenu();
     fs.writeFileSync(DATA_FILE, JSON.stringify(d, null, 2), "utf8");
@@ -383,9 +379,9 @@ function writeMenu(menu) {
 /* -------------------------
    Public Menu
 ------------------------- */
-app.get("/api/menu", (req, res) => res.json(readMenu()));
+app.get("/api/menu", (_req, res) => res.json(readMenu()));
 
-app.get("/api/menu/flat", (req, res) => {
+app.get("/api/menu/flat", (_req, res) => {
   const d = readMenu();
   const out = [];
   for (const c of d.categories || []) {
@@ -424,7 +420,7 @@ const limitDiscountAdminRequests = rateLimit({
 });
 
 const publicDiscountRateLimit = rateLimit({
-  windowMs: 60 * 1000,
+  windowMs: 60_000,
   limit: 30,
   standardHeaders: true,
   legacyHeaders: false,
@@ -436,10 +432,11 @@ app.post("/api/admin/login", (req, res) => {
     const adminPass = requireEnv("ADMIN_PASSWORD");
     requireEnv("JWT_SECRET");
 
-    const password = (req.body?.password || "").toString();
+    const password = String(req.body?.password || "");
     if (!password || password !== adminPass) {
       return res.status(401).json({ error: "Wrong password" });
     }
+
     return res.json({ token: signToken() });
   } catch (e) {
     return res.status(500).json({ error: e.message || "Server misconfigured" });
@@ -462,7 +459,6 @@ function coerceMenuBody(body) {
   }
 
   if (body?.menu && Array.isArray(body.menu.categories)) return body.menu;
-
   return null;
 }
 
@@ -472,7 +468,6 @@ function sanitizeMenu(menu) {
   for (const cat of menu.categories) {
     cat.name = (cat.name ?? "").toString().trim();
     if (!cat.name) throw new Error("Category name missing");
-
     if (!Array.isArray(cat.items)) throw new Error("Invalid items for category: " + cat.name);
 
     for (const it of cat.items) {
@@ -485,7 +480,7 @@ function sanitizeMenu(menu) {
       if (!it.name) throw new Error("Item name missing in: " + cat.name);
       if (!Number.isFinite(it.price) || it.price < 0) throw new Error("Invalid price for: " + it.name);
 
-      if (!it.image && it.img) it.image = (it.img ?? "").toString().trim();
+      if (!it.image && it.img) it.image = String(it.img ?? "").trim();
     }
   }
 
@@ -496,7 +491,6 @@ app.put("/api/admin/menu", requireAdmin, (req, res) => {
   try {
     const menu = coerceMenuBody(req.body);
     if (!menu) return res.status(400).json({ error: "Invalid menu format" });
-
     const clean = sanitizeMenu(menu);
     const saved = writeMenu(clean);
     return res.json(saved);
@@ -508,12 +502,11 @@ app.put("/api/admin/menu", requireAdmin, (req, res) => {
 /* -------------------------
    Discounts (Supabase REST)
 ------------------------- */
-app.get("/api/discounts", publicDiscountRateLimit, async (req, res) => {
+app.get("/api/discounts", publicDiscountRateLimit, async (_req, res) => {
   try {
     const discounts = await getDiscounts();
-    const now = Date.now();
     const active = discounts
-      .filter((discount) => discount.active && (!discount.expiresAt || new Date(discount.expiresAt).getTime() >= now))
+      .filter((d) => isDiscountUsable(d).ok)
       .map(({ id, code, type, value, expiresAt, minSubtotal, description }) => ({
         id,
         code,
@@ -521,7 +514,7 @@ app.get("/api/discounts", publicDiscountRateLimit, async (req, res) => {
         value,
         expiresAt,
         minSubtotal,
-        description
+        description,
       }));
     return res.json({ discounts: active });
   } catch (e) {
@@ -529,7 +522,7 @@ app.get("/api/discounts", publicDiscountRateLimit, async (req, res) => {
   }
 });
 
-app.get("/api/admin/discounts", limitDiscountAdminRequests, requireAdmin, async (req, res) => {
+app.get("/api/admin/discounts", limitDiscountAdminRequests, requireAdmin, async (_req, res) => {
   try {
     return res.json(await getDiscounts());
   } catch (e) {
@@ -568,6 +561,19 @@ app.put("/api/admin/discounts/:id/status", limitDiscountAdminRequests, requireAd
   }
 });
 
+app.patch("/api/admin/discounts/:id/status", limitDiscountAdminRequests, requireAdmin, async (req, res) => {
+  try {
+    if (typeof req.body?.active !== "boolean") {
+      return res.status(400).json({ error: "'active' boolean is required" });
+    }
+    const discount = await updateDiscount(req.params.id, { active: req.body.active });
+    if (!discount) return res.status(404).json({ error: "Discount not found" });
+    return res.json(discount);
+  } catch (e) {
+    return res.status(400).json({ error: e.message || "Unable to update discount status" });
+  }
+});
+
 app.delete("/api/admin/discounts/:id", limitDiscountAdminRequests, requireAdmin, async (req, res) => {
   try {
     await deleteDiscount(req.params.id);
@@ -586,19 +592,6 @@ app.post("/api/discounts/validate", publicDiscountRateLimit, async (req, res) =>
   }
 });
 
-app.patch("/api/admin/discounts/:id/status", limitDiscountAdminRequests, requireAdmin, async (req, res) => {
-  try {
-    if (typeof req.body?.active !== "boolean") {
-      return res.status(400).json({ error: "'active' boolean is required" });
-    }
-    const discount = await updateDiscount(req.params.id, { active: req.body.active });
-    if (!discount) return res.status(404).json({ error: "Discount not found" });
-    return res.json(discount);
-  } catch (e) {
-    return res.status(400).json({ error: e.message || "Unable to update discount status" });
-  }
-});
-
 /* -------------------------
    Cloudflare R2 Upload (Admin)
 ------------------------- */
@@ -608,13 +601,10 @@ function requireR2Env() {
     "R2_ACCESS_KEY_ID",
     "R2_SECRET_ACCESS_KEY",
     "R2_BUCKET_NAME",
-    "R2_PUBLIC_BASE_URL"
+    "R2_PUBLIC_BASE_URL",
   ];
-
   const missing = required.filter((k) => !(process.env[k] || "").trim());
-  if (missing.length) {
-    throw new Error("Missing R2 env vars: " + missing.join(", "));
-  }
+  if (missing.length) throw new Error("Missing R2 env vars: " + missing.join(", "));
 }
 
 const r2 = new S3Client({
@@ -622,26 +612,23 @@ const r2 = new S3Client({
   endpoint: `https://${process.env.CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com`,
   credentials: {
     accessKeyId: process.env.R2_ACCESS_KEY_ID,
-    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
-  }
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+  },
 });
 
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
+  fileFilter: (_req, file, cb) => {
     const ok = /^image\/(jpeg|png|webp)$/i.test(file.mimetype || "");
     cb(ok ? null : new Error("Only JPG/PNG/WebP allowed"), ok);
-  }
+  },
 });
 
 app.post("/api/admin/upload", requireAdmin, upload.single("image"), async (req, res) => {
   try {
     requireR2Env();
-
-    if (!req.file?.buffer) {
-      return res.status(400).json({ error: "No file uploaded" });
-    }
+    if (!req.file?.buffer) return res.status(400).json({ error: "No file uploaded" });
 
     const ext = (req.file.originalname.split(".").pop() || "webp").toLowerCase();
     const key = `menu/${crypto.randomUUID()}.${ext}`;
@@ -651,13 +638,12 @@ app.post("/api/admin/upload", requireAdmin, upload.single("image"), async (req, 
         Bucket: process.env.R2_BUCKET_NAME,
         Key: key,
         Body: req.file.buffer,
-        ContentType: req.file.mimetype
+        ContentType: req.file.mimetype,
       })
     );
 
     const base = process.env.R2_PUBLIC_BASE_URL.replace(/\/+$/, "");
     const url = `${base}/${key}`;
-
     return res.json({ url, key });
   } catch (e) {
     console.error(e);
@@ -672,6 +658,7 @@ app.post("/api/orders", async (req, res) => {
   try {
     const body = req.body || {};
     const discountCode = String(body.discountCode ?? "").trim();
+
     const subtotalInput = body.subtotal ?? (discountCode ? undefined : body.total ?? body.amount ?? 0);
     const subtotal = Number(subtotalInput);
     if (!Number.isFinite(subtotal) || subtotal < 0) {
@@ -694,15 +681,10 @@ app.post("/api/orders", async (req, res) => {
       finalTotal: total,
       ...(discount ? { discount } : {}),
       status: "paid",
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
     };
 
     createOrder(order);
-
-    console.log("✅ ORDER SAVED:", order.id);
-    console.log("📦 TOTAL ORDERS:", getOrders().length);
-    console.log("🧾 ORDER DATA:", order);
-
     res.json({ success: true, order });
   } catch (e) {
     console.error("❌ ORDER SAVE FAILED", e);
@@ -710,7 +692,7 @@ app.post("/api/orders", async (req, res) => {
   }
 });
 
-app.get("/api/orders/admin", requireAdmin, (req, res) => {
+app.get("/api/orders/admin", requireAdmin, (_req, res) => {
   res.json(getOrders());
 });
 
@@ -719,15 +701,13 @@ app.get("/api/orders/admin", requireAdmin, (req, res) => {
 ------------------------- */
 async function paystackInitialize({ email, amount, currency }) {
   const secret = requireEnv("PAYSTACK_SECRET_KEY");
-  const url = "https://api.paystack.co/transaction/initialize";
-
-  const r = await fetch(url, {
+  const r = await fetch("https://api.paystack.co/transaction/initialize", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${secret}`,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
     },
-    body: JSON.stringify({ email, amount, currency: currency || "GHS" })
+    body: JSON.stringify({ email, amount, currency: currency || "GHS" }),
   });
 
   const data = await r.json().catch(() => ({}));
@@ -737,18 +717,20 @@ async function paystackInitialize({ email, amount, currency }) {
 
 async function paystackVerify(reference) {
   const secret = requireEnv("PAYSTACK_SECRET_KEY");
-  const url = `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`;
+  const r = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${secret}` },
+  });
 
-  const r = await fetch(url, { method: "GET", headers: { Authorization: `Bearer ${secret}` } });
   const data = await r.json().catch(() => ({}));
   if (!r.ok || !data.status) throw new Error(data?.message || "Paystack verify failed");
   return data.data;
 }
 
 function validateInitBody(req) {
-  const email = (req.body?.email || "").toString().trim();
+  const email = String(req.body?.email || "").trim();
   const amount = Number(req.body?.amount || 0);
-  const currency = (req.body?.currency || "GHS").toString();
+  const currency = String(req.body?.currency || "GHS");
 
   if (!email) throw new Error("Email is required");
   if (!Number.isFinite(amount) || amount < 50) throw new Error("Amount is invalid");
@@ -769,12 +751,11 @@ async function handleInitialize(req, res) {
 
 async function handleVerify(req, res) {
   try {
-    const reference = (req.params.reference || "").toString().trim();
+    const reference = String(req.params.reference || "").trim();
     if (!reference) return res.status(400).json({ error: "Missing reference" });
 
     const tx = await paystackVerify(reference);
     if (tx.status === "success") return res.json({ status: "success", reference });
-
     return res.json({ status: tx.status || "unknown", reference });
   } catch (e) {
     return res.status(400).json({ error: e.message || "Verify failed" });
@@ -786,4 +767,6 @@ app.get("/api/paystack/verify/:reference", handleVerify);
 app.post("/paystack/initialize", handleInitialize);
 app.get("/paystack/verify/:reference", handleVerify);
 
-app.listen(PORT, () => console.log("Server running on port", PORT));
+app.listen(PORT, () => {
+  console.log("Server running on port", PORT);
+});
