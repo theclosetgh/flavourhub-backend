@@ -6,6 +6,7 @@ import path from "path";
 import jwt from "jsonwebtoken";
 import multer from "multer";
 import crypto from "crypto";
+import { rateLimit } from "express-rate-limit";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { createOrder, getOrders } from "./orders.store.js";
 import {
@@ -218,28 +219,13 @@ function requireAdmin(req, res, next) {
   }
 }
 
-const discountAdminRequests = new Map();
-function limitDiscountAdminRequests(req, res, next) {
-  const now = Date.now();
-  const client = req.ip || req.socket.remoteAddress || "unknown";
-  let bucket = discountAdminRequests.get(client);
-
-  if (!bucket || bucket.resetAt <= now) {
-    if (!bucket && discountAdminRequests.size >= 1000) {
-      discountAdminRequests.delete(discountAdminRequests.keys().next().value);
-    }
-    bucket = { count: 0, resetAt: now + 60_000 };
-    discountAdminRequests.set(client, bucket);
-  }
-
-  if (bucket.count >= 120) {
-    res.set("Retry-After", Math.ceil((bucket.resetAt - now) / 1000).toString());
-    return res.status(429).json({ error: "Too many discount admin requests; try again shortly" });
-  }
-
-  bucket.count += 1;
-  return next();
-}
+const limitDiscountAdminRequests = rateLimit({
+  windowMs: 60_000,
+  limit: 120,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { error: "Too many discount admin requests; try again shortly" }
+});
 
 app.post("/api/admin/login", (req, res) => {
   try {
