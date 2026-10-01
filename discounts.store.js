@@ -2,90 +2,168 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 
-/* -------------------------
-   Discount Storage (discounts.json)
-   NOTE: File storage may reset on redeploy.
-------------------------- */
-const DATA_FILE = path.join(process.cwd(), "discounts.json");
+const DISCOUNTS_FILE = path.join(process.cwd(), "discounts.json");
 
-function defaultData() {
-  return { updatedAt: new Date().toISOString(), discounts: [] };
-}
-
-function readData() {
+function readDiscounts() {
   try {
-    if (!fs.existsSync(DATA_FILE)) {
-      const d = defaultData();
-      fs.writeFileSync(DATA_FILE, JSON.stringify(d, null, 2), "utf8");
-      return d;
+    if (!fs.existsSync(DISCOUNTS_FILE)) {
+      writeDiscounts([]);
+      return [];
     }
-    const raw = fs.readFileSync(DATA_FILE, "utf8");
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed.discounts)) parsed.discounts = [];
-    return parsed;
-  } catch {
-    const d = defaultData();
-    fs.writeFileSync(DATA_FILE, JSON.stringify(d, null, 2), "utf8");
-    return d;
+
+    const data = JSON.parse(fs.readFileSync(DISCOUNTS_FILE, "utf8"));
+    const discounts = Array.isArray(data) ? data : data?.discounts;
+    if (!Array.isArray(discounts)) throw new Error("Invalid discounts file");
+    return discounts;
+  } catch (error) {
+    if (!fs.existsSync(DISCOUNTS_FILE)) return [];
+    throw error;
   }
 }
 
-function writeData(discounts) {
-  const data = { updatedAt: new Date().toISOString(), discounts };
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
-  return data;
+function writeDiscounts(discounts) {
+  fs.writeFileSync(
+    DISCOUNTS_FILE,
+    JSON.stringify({ updatedAt: new Date().toISOString(), discounts }, null, 2) + "\n",
+    "utf8"
+  );
+  return discounts;
+}
+
+function normalizeExpiration(value) {
+  if (value === undefined || value === null || value === "") return null;
+
+  let date;
+  if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    date = new Date(`${value}T23:59:59.999Z`);
+    if (date.toISOString().slice(0, 10) !== value) throw new Error("Invalid expiration date");
+  } else {
+    date = new Date(value);
+  }
+  if (!Number.isFinite(date.getTime())) throw new Error("Invalid expiration date");
+  return date.toISOString();
+}
+
+function normalizeDiscount(input, existing = {}) {
+  const data = { ...existing, ...input };
+  const code = String(data.code ?? "").trim().toUpperCase();
+  if (!/^[A-Z0-9_-]{2,40}$/.test(code)) {
+    throw new Error("Code must be 2-40 letters, numbers, hyphens, or underscores");
+  }
+
+  const type = String(data.type ?? "").trim().toLowerCase();
+  if (!["percentage", "fixed"].includes(type)) {
+    throw new Error("Type must be percentage or fixed");
+  }
+
+  const value = Number(data.value);
+  if (!Number.isFinite(value) || value <= 0 || (type === "percentage" && value > 100)) {
+    throw new Error(type === "percentage" ? "Percentage must be greater than 0 and at most 100" : "Value must be greater than 0");
+  }
+
+  const active = data.active === undefined ? true : data.active;
+  if (typeof active !== "boolean") throw new Error("Active must be a boolean");
+
+  const minSubtotal = data.minSubtotal === undefined || data.minSubtotal === null || data.minSubtotal === ""
+    ? 0
+    : Number(data.minSubtotal);
+  if (!Number.isFinite(minSubtotal) || minSubtotal < 0) {
+    throw new Error("Minimum subtotal must be a non-negative number");
+  }
+
+  return {
+    ...existing,
+    id: existing.id || crypto.randomUUID(),
+    code,
+    type,
+    value,
+    active,
+    expiresAt: normalizeExpiration(data.expiresAt),
+    minSubtotal,
+    description: String(data.description ?? "").trim(),
+    createdAt: existing.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
 }
 
 export function getDiscounts() {
-  return readData().discounts;
+  return readDiscounts();
 }
 
 export function getDiscountById(id) {
-  return getDiscounts().find((d) => d.id === id) || null;
+  return getDiscounts().find((discount) => discount.id === id) || null;
 }
 
-export function getDiscountByCode(code) {
-  const normalized = (code || "").toString().trim().toUpperCase();
-  if (!normalized) return null;
-  return getDiscounts().find((d) => d.code === normalized) || null;
+export function getDiscountByCode(codeInput) {
+  const code = String(codeInput ?? "").trim().toUpperCase();
+  if (!code) return null;
+  return getDiscounts().find((discount) => discount.code === code) || null;
 }
 
-export function createDiscount(discount) {
-  const discounts = getDiscounts();
-  const now = new Date().toISOString();
-  const record = {
-    id: "DISC-" + Date.now() + "-" + crypto.randomBytes(3).toString("hex"),
-    ...discount,
-    createdAt: now,
-    updatedAt: now,
-  };
-  discounts.unshift(record);
-  writeData(discounts);
-  return record;
+export function createDiscount(input) {
+  const discounts = readDiscounts();
+  const discount = normalizeDiscount(input);
+  if (discounts.some((item) => item.code === discount.code)) {
+    throw new Error("A discount with this code already exists");
+  }
+  discounts.unshift(discount);
+  writeDiscounts(discounts);
+  return discount;
 }
 
-export function updateDiscount(id, updates) {
-  const discounts = getDiscounts();
-  const idx = discounts.findIndex((d) => d.id === id);
-  if (idx === -1) return null;
+export function updateDiscount(id, input) {
+  const discounts = readDiscounts();
+  const index = discounts.findIndex((item) => item.id === id);
+  if (index === -1) return null;
 
-  const updated = {
-    ...discounts[idx],
-    ...updates,
-    id: discounts[idx].id,
-    createdAt: discounts[idx].createdAt,
-    updatedAt: new Date().toISOString(),
-  };
-  discounts[idx] = updated;
-  writeData(discounts);
-  return updated;
+  const discount = normalizeDiscount(input, discounts[index]);
+  if (discounts.some((item, itemIndex) => itemIndex !== index && item.code === discount.code)) {
+    throw new Error("A discount with this code already exists");
+  }
+  discounts[index] = discount;
+  writeDiscounts(discounts);
+  return discount;
 }
 
 export function deleteDiscount(id) {
-  const discounts = getDiscounts();
-  const idx = discounts.findIndex((d) => d.id === id);
-  if (idx === -1) return false;
-  discounts.splice(idx, 1);
-  writeData(discounts);
+  const discounts = readDiscounts();
+  const filtered = discounts.filter((item) => item.id !== id);
+  if (filtered.length === discounts.length) return false;
+  writeDiscounts(filtered);
   return true;
+}
+
+export function calculateDiscount(codeInput, subtotalInput, now = new Date()) {
+  const code = String(codeInput ?? "").trim().toUpperCase();
+  if (!code) throw new Error("Discount code is required");
+
+  const subtotal = Number(subtotalInput);
+  if (!Number.isFinite(subtotal) || subtotal < 0) throw new Error("Subtotal must be a non-negative number");
+
+  const discount = getDiscountByCode(code);
+  if (!discount) throw new Error("Invalid discount code");
+  if (!discount.active) throw new Error("This discount is inactive");
+  if (discount.expiresAt && now.getTime() > new Date(discount.expiresAt).getTime()) {
+    throw new Error("This discount has expired");
+  }
+  if (subtotal < (discount.minSubtotal || 0)) {
+    throw new Error(`Subtotal must be at least ${discount.minSubtotal} to use this discount`);
+  }
+
+  const round = (amount) => Math.round((amount + Number.EPSILON) * 100) / 100;
+  const discountAmount = Math.min(
+    subtotal,
+    round(discount.type === "percentage" ? subtotal * discount.value / 100 : discount.value)
+  );
+  const total = round(subtotal - discountAmount);
+
+  return {
+    code: discount.code,
+    type: discount.type,
+    value: discount.value,
+    subtotal: round(subtotal),
+    discountAmount,
+    total,
+    finalTotal: total
+  };
 }
