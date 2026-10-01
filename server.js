@@ -8,14 +8,8 @@ import multer from "multer";
 import crypto from "crypto";
 import { rateLimit } from "express-rate-limit";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { Pool } from "pg";
 import { createOrder, getOrders } from "./orders.store.js";
-import {
-  calculateDiscount,
-  createDiscount,
-  deleteDiscount,
-  getDiscounts,
-  updateDiscount
-} from "./discounts.store.js";
 
 dotenv.config();
 
@@ -26,7 +20,263 @@ app.get("/", (req, res) => {
   res.send("🚀 FlavourHub backend is live");
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
+
+/* -------------------------
+   Helpers
+------------------------- */
+function requireEnv(name) {
+  const v = (process.env[name] || "").trim();
+  if (!v) throw new Error(`${name} not set`);
+  return v;
+}
+
+/* -------------------------
+   PostgreSQL (Discounts)
+------------------------- */
+const DATABASE_URL = requireEnv("DATABASE_URL");
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: process.env.PGSSL === "false" ? false : { rejectUnauthorized: false },
+});
+
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS discounts (
+      id UUID PRIMARY KEY,
+      code TEXT NOT NULL UNIQUE,
+      type TEXT NOT NULL CHECK (type IN ('percentage', 'fixed')),
+      value NUMERIC(12,2) NOT NULL CHECK (value > 0),
+      active BOOLEAN NOT NULL DEFAULT true,
+      expires_at TIMESTAMPTZ NULL,
+      min_subtotal NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (min_subtotal >= 0),
+      description TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+}
+
+function mapDiscountRow(row) {
+  return {
+    id: row.id,
+    code: row.code,
+    type: row.type,
+    value: Number(row.value),
+    active: !!row.active,
+    expiresAt: row.expires_at ? new Date(row.expires_at).toISOString() : null,
+    minSubtotal: Number(row.min_subtotal || 0),
+    description: row.description || "",
+    createdAt: row.created_at ? new Date(row.created_at).toISOString() : null,
+    updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+  };
+}
+
+function sanitizeDiscountInput(body, { partial = false } = {}) {
+  const out = {};
+  const has = (k) => Object.prototype.hasOwnProperty.call(body || {}, k);
+
+  if (!partial || has("code")) {
+    const code = String(body?.code ?? "").trim().toUpperCase();
+    if (!/^[A-Z0-9_-]{2,40}$/.test(code)) {
+      throw new Error("Code must be 2-40 letters, numbers, hyphens, or underscores");
+    }
+    out.code = code;
+  }
+
+  if (!partial || has("type")) {
+    const type = String(body?.type ?? "").trim().toLowerCase();
+    if (!["percentage", "fixed"].includes(type)) {
+      throw new Error("Type must be percentage or fixed");
+    }
+    out.type = type;
+  }
+
+  if (!partial || has("value")) {
+    const value = Number(body?.value);
+    const typeForValidation = out.type || String(body?.type ?? "").trim().toLowerCase();
+    if (!Number.isFinite(value) || value <= 0) throw new Error("Value must be greater than 0");
+    if (typeForValidation === "percentage" && value > 100) {
+      throw new Error("Percentage must be greater than 0 and at most 100");
+    }
+    out.value = Number(value.toFixed(2));
+  }
+
+  if (!partial || has("active")) {
+    const active = body?.active === undefined ? true : body.active;
+    if (typeof active !== "boolean") throw new Error("Active must be a boolean");
+    out.active = active;
+  }
+
+  if (!partial || has("expiresAt")) {
+    const raw = body?.expiresAt;
+    if (raw === undefined || raw === null || raw === "") {
+      out.expiresAt = null;
+    } else {
+      const d = new Date(raw);
+      if (!Number.isFinite(d.getTime())) throw new Error("Invalid expiration date");
+      out.expiresAt = d.toISOString();
+    }
+  }
+
+  if (!partial || has("minSubtotal")) {
+    const raw = body?.minSubtotal;
+    const minSubtotal = raw === undefined || raw === null || raw === "" ? 0 : Number(raw);
+    if (!Number.isFinite(minSubtotal) || minSubtotal < 0) {
+      throw new Error("Minimum subtotal must be a non-negative number");
+    }
+    out.minSubtotal = Number(minSubtotal.toFixed(2));
+  }
+
+  if (!partial || has("description")) {
+    out.description = String(body?.description ?? "").trim();
+  }
+
+  return out;
+}
+
+async function getDiscounts() {
+  const { rows } = await pool.query(`SELECT * FROM discounts ORDER BY created_at DESC`);
+  return rows.map(mapDiscountRow);
+}
+
+async function getDiscountById(id) {
+  const { rows } = await pool.query(`SELECT * FROM discounts WHERE id = $1 LIMIT 1`, [id]);
+  return rows[0] ? mapDiscountRow(rows[0]) : null;
+}
+
+async function getDiscountByCode(codeInput) {
+  const code = String(codeInput ?? "").trim().toUpperCase();
+  if (!code) return null;
+  const { rows } = await pool.query(`SELECT * FROM discounts WHERE code = $1 LIMIT 1`, [code]);
+  return rows[0] ? mapDiscountRow(rows[0]) : null;
+}
+
+async function createDiscount(input) {
+  const clean = sanitizeDiscountInput(input, { partial: false });
+  const id = crypto.randomUUID();
+
+  try {
+    const { rows } = await pool.query(
+      `
+      INSERT INTO discounts (id, code, type, value, active, expires_at, min_subtotal, description, created_at, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now(), now())
+      RETURNING *;
+      `,
+      [
+        id,
+        clean.code,
+        clean.type,
+        clean.value,
+        clean.active ?? true,
+        clean.expiresAt,
+        clean.minSubtotal ?? 0,
+        clean.description ?? "",
+      ]
+    );
+    return mapDiscountRow(rows[0]);
+  } catch (e) {
+    if (String(e?.message || "").includes("duplicate key")) {
+      throw new Error("A discount with this code already exists");
+    }
+    throw e;
+  }
+}
+
+async function updateDiscount(id, input) {
+  const existing = await getDiscountById(id);
+  if (!existing) return null;
+
+  const mergedInput = { ...existing, ...input };
+  const clean = sanitizeDiscountInput(mergedInput, { partial: false });
+
+  try {
+    const { rows } = await pool.query(
+      `
+      UPDATE discounts
+      SET code = $2,
+          type = $3,
+          value = $4,
+          active = $5,
+          expires_at = $6,
+          min_subtotal = $7,
+          description = $8,
+          updated_at = now()
+      WHERE id = $1
+      RETURNING *;
+      `,
+      [
+        id,
+        clean.code,
+        clean.type,
+        clean.value,
+        clean.active ?? true,
+        clean.expiresAt,
+        clean.minSubtotal ?? 0,
+        clean.description ?? "",
+      ]
+    );
+    return rows[0] ? mapDiscountRow(rows[0]) : null;
+  } catch (e) {
+    if (String(e?.message || "").includes("duplicate key")) {
+      throw new Error("A discount with this code already exists");
+    }
+    throw e;
+  }
+}
+
+async function deleteDiscount(id) {
+  const r = await pool.query(`DELETE FROM discounts WHERE id = $1`, [id]);
+  return r.rowCount > 0;
+}
+
+function isDiscountUsable(discount) {
+  if (!discount) return { ok: false, reason: "Discount not found" };
+  if (!discount.active) return { ok: false, reason: "Discount is inactive" };
+  if (discount.expiresAt && new Date(discount.expiresAt).getTime() < Date.now()) {
+    return { ok: false, reason: "Discount has expired" };
+  }
+  return { ok: true };
+}
+
+function computeDiscount(discount, subtotal) {
+  const amount =
+    discount.type === "percentage"
+      ? (subtotal * Number(discount.value)) / 100
+      : Number(discount.value);
+
+  const discountAmount = Math.min(Math.max(amount, 0), subtotal);
+  const total = Math.max(subtotal - discountAmount, 0);
+  const round = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
+
+  return { discountAmount: round(discountAmount), total: round(total) };
+}
+
+async function resolveDiscountForSubtotal(code, subtotal) {
+  const sub = Number(subtotal);
+  if (!Number.isFinite(sub) || sub < 0) throw new Error("A valid subtotal is required");
+
+  const discount = await getDiscountByCode(code);
+  const usable = isDiscountUsable(discount);
+  if (!usable.ok) throw new Error(usable.reason);
+
+  if (sub < Number(discount.minSubtotal || 0)) {
+    throw new Error(`Subtotal must be at least ${discount.minSubtotal} to use this discount`);
+  }
+
+  const { discountAmount, total } = computeDiscount(discount, sub);
+
+  return {
+    id: discount.id,
+    code: discount.code,
+    type: discount.type,
+    value: discount.value,
+    subtotal: sub,
+    discountAmount,
+    total,
+    finalTotal: total,
+  };
+}
 
 /* -------------------------
    CORS
@@ -50,20 +300,20 @@ app.use(
 );
 
 /* -------------------------
-   Helpers
-------------------------- */
-function requireEnv(name) {
-  const v = (process.env[name] || "").trim();
-  if (!v) throw new Error(`${name} not set`);
-  return v;
-}
-
-/* -------------------------
    Health
 ------------------------- */
-app.get("/api/health", (req, res) => {
+app.get("/api/health", async (req, res) => {
+  let dbOk = false;
+  try {
+    await pool.query("SELECT 1");
+    dbOk = true;
+  } catch {
+    dbOk = false;
+  }
+
   res.json({
     ok: true,
+    dbOk,
     hasPaystackKeys: !!process.env.PAYSTACK_SECRET_KEY && !!process.env.PAYSTACK_PUBLIC_KEY,
     hasAdminPassword: !!process.env.ADMIN_PASSWORD,
     hasJwtSecret: !!process.env.JWT_SECRET,
@@ -79,87 +329,11 @@ app.get("/api/health", (req, res) => {
 
 /* -------------------------
    Menu Storage (menu.json)
-   NOTE: File storage may reset on redeploy.
 ------------------------- */
 const DATA_FILE = path.join(process.cwd(), "menu.json");
 
 function defaultMenu() {
-  return {
-    updatedAt: new Date().toISOString(),
-    categories: [
-      {
-        name: "Shawarma",
-        items: [
-          { id: "shaw1", name: "Sizzling Shawarma (Chicken)", price: 50, desc: "Classic chicken shawarma.", image: "" },
-          { id: "shaw2", name: "Minced with Flavour (Minced Meat)", price: 60, desc: "Minced meat shawarma with signature flavour.", image: "" },
-          { id: "shaw3", name: "Flavor Twist (Shredded Beef)", price: 80, desc: "Shredded beef shawarma.", image: "" },
-          { id: "shaw4", name: "Flavor Twist (Shredded Beef & Chicken)", price: 90, desc: "Mixed shredded beef and chicken.", image: "" }
-        ]
-      },
-      {
-        name: "Shawarma + Fries",
-        items: [
-          { id: "sf1", name: "Chic ’n’ Chips (Chicken Shawarma + Fries)", price: 65, desc: "Chicken shawarma served with fries.", image: "" },
-          { id: "sf2", name: "Beef ’n’ Fries Fusion (Minced Meat + Fries)", price: 75, desc: "Minced meat shawarma with fries.", image: "" },
-          { id: "sf3", name: "Beef ’n’ Fries Fusion (Shredded Beef + Fries)", price: 90, desc: "Shredded beef shawarma with fries.", image: "" }
-        ]
-      },
-      {
-        name: "Noodles",
-        items: [
-          { id: "n1", name: "Budget Bowl Series — Medium", price: 40, desc: "Corned beef, egg & sausage.", image: "" },
-          { id: "n2", name: "Budget Bowl Series — Large", price: 60, desc: "Corned beef, egg & sausage.", image: "" },
-          { id: "n3", name: "Golden Chicken Strings (Chicken Only)", price: 70, desc: "Chicken-only noodles.", image: "" },
-          { id: "n4", name: "Street Beef Vibes (Beef Only)", price: 90, desc: "Beef-only noodles.", image: "" }
-        ]
-      },
-      {
-        name: "Spaghetti",
-        items: [
-          { id: "sp1", name: "Quick Prep — Medium", price: 40, desc: "Corned beef, egg & sausage.", image: "" },
-          { id: "sp2", name: "Quick Prep — Large", price: 60, desc: "Corned beef, egg & sausage.", image: "" },
-          { id: "sp3", name: "Savory Beef Bowl", price: 80, desc: "Beef spaghetti bowl.", image: "" },
-          { id: "sp4", name: "Chicken Royal (Chicken Only)", price: 60, desc: "Chicken-only spaghetti.", image: "" }
-        ]
-      },
-      {
-        name: "Loaded Fries",
-        items: [
-          { id: "lf1", name: "Flavour Burst Fries", price: 100, desc: "Fries with beef or chicken & cheese.", image: "" },
-          { id: "lf2", name: "Melt and Crunch", price: 130, desc: "Fries with beef or chicken, extra cheese.", image: "" }
-        ]
-      },
-      {
-        name: "Special Combos",
-        items: [
-          { id: "c1", name: "Obolo Bia Ye Guy (Chicken & Beef Shawarma with Fries)", price: 150, desc: "Chicken & beef shawarma with fries.", image: "" },
-          { id: "c2", name: "Big Man (Chicken & Beef Noodles)", price: 140, desc: "Chicken & beef noodles.", image: "" },
-          { id: "c3", name: "Full Flavour (Chicken & Beef Spaghetti)", price: 100, desc: "Chicken & beef spaghetti.", image: "" }
-        ]
-      },
-      {
-        name: "Extras",
-        items: [
-          { id: "e1", name: "Fries", price: 20, desc: "Extra fries.", image: "" },
-          { id: "e2", name: "Wings (6 pcs)", price: 50, desc: "Six pieces of wings.", image: "" },
-          { id: "e3", name: "Cheese", price: 20, desc: "Extra cheese.", image: "" },
-          { id: "e4", name: "Bacon", price: 18, desc: "Add bacon.", image: "" },
-          { id: "e5", name: "Egg", price: 8, desc: "Add egg.", image: "" }
-        ]
-      },
-      {
-        name: "Local Drinks",
-        items: [
-          { id: "ld1", name: "Obolo Sobolo Can", price: 40, desc: "", image: "" },
-          { id: "ld2", name: "Biggie Bissap Can", price: 30, desc: "", image: "" },
-          { id: "ld3", name: "Smallie Can", price: 20, desc: "", image: "" },
-          { id: "ld4", name: "Obolo Pine Can", price: 40, desc: "Pineapple drink.", image: "" },
-          { id: "ld5", name: "Biggie Pine Can", price: 30, desc: "Pineapple drink.", image: "" },
-          { id: "ld6", name: "Smallie Pine Can", price: 20, desc: "Small pineapple drink.", image: "" }
-        ]
-      }
-    ]
-  };
+  return { updatedAt: new Date().toISOString(), categories: [] };
 }
 
 function readMenu() {
@@ -310,43 +484,48 @@ app.put("/api/admin/menu", requireAdmin, (req, res) => {
 });
 
 /* -------------------------
-   Admin Discounts
+   Discounts (Postgres-backed)
 ------------------------- */
-app.get("/api/discounts", publicDiscountRateLimit, (req, res) => {
-  const now = Date.now();
-  const discounts = getDiscounts()
-    .filter((discount) => discount.active && (!discount.expiresAt || new Date(discount.expiresAt).getTime() >= now))
-    .map(({ id, code, type, value, expiresAt, minSubtotal, description }) => ({
-      id,
-      code,
-      type,
-      value,
-      expiresAt,
-      minSubtotal,
-      description
-    }));
-  return res.json({ discounts });
-});
-
-app.get("/api/admin/discounts", limitDiscountAdminRequests, requireAdmin, (req, res) => {
+app.get("/api/discounts", publicDiscountRateLimit, async (req, res) => {
   try {
-    return res.json(getDiscounts());
+    const discounts = await getDiscounts();
+    const active = discounts
+      .filter((d) => isDiscountUsable(d).ok)
+      .map(({ id, code, type, value, expiresAt, minSubtotal, description }) => ({
+        id,
+        code,
+        type,
+        value,
+        expiresAt,
+        minSubtotal,
+        description,
+      }));
+    return res.json({ discounts: active });
   } catch {
     return res.status(500).json({ error: "Unable to load discounts" });
   }
 });
 
-app.post("/api/admin/discounts", limitDiscountAdminRequests, requireAdmin, (req, res) => {
+app.get("/api/admin/discounts", limitDiscountAdminRequests, requireAdmin, async (req, res) => {
   try {
-    return res.status(201).json(createDiscount(req.body || {}));
+    return res.json({ discounts: await getDiscounts() });
+  } catch {
+    return res.status(500).json({ error: "Unable to load discounts" });
+  }
+});
+
+app.post("/api/admin/discounts", limitDiscountAdminRequests, requireAdmin, async (req, res) => {
+  try {
+    const created = await createDiscount(req.body || {});
+    return res.status(201).json(created);
   } catch (e) {
     return res.status(400).json({ error: e.message || "Invalid discount" });
   }
 });
 
-app.put("/api/admin/discounts/:id", limitDiscountAdminRequests, requireAdmin, (req, res) => {
+app.put("/api/admin/discounts/:id", limitDiscountAdminRequests, requireAdmin, async (req, res) => {
   try {
-    const discount = updateDiscount(req.params.id, req.body || {});
+    const discount = await updateDiscount(req.params.id, req.body || {});
     if (!discount) return res.status(404).json({ error: "Discount not found" });
     return res.json(discount);
   } catch (e) {
@@ -354,12 +533,12 @@ app.put("/api/admin/discounts/:id", limitDiscountAdminRequests, requireAdmin, (r
   }
 });
 
-app.put("/api/admin/discounts/:id/status", limitDiscountAdminRequests, requireAdmin, (req, res) => {
+app.patch("/api/admin/discounts/:id/status", limitDiscountAdminRequests, requireAdmin, async (req, res) => {
   try {
     if (typeof req.body?.active !== "boolean") {
-      return res.status(400).json({ error: "Active must be a boolean" });
+      return res.status(400).json({ error: "'active' boolean is required" });
     }
-    const discount = updateDiscount(req.params.id, { active: req.body.active });
+    const discount = await updateDiscount(req.params.id, { active: req.body.active });
     if (!discount) return res.status(404).json({ error: "Discount not found" });
     return res.json(discount);
   } catch (e) {
@@ -367,36 +546,27 @@ app.put("/api/admin/discounts/:id/status", limitDiscountAdminRequests, requireAd
   }
 });
 
-app.delete("/api/admin/discounts/:id", limitDiscountAdminRequests, requireAdmin, (req, res) => {
+app.delete("/api/admin/discounts/:id", limitDiscountAdminRequests, requireAdmin, async (req, res) => {
   try {
-    if (!deleteDiscount(req.params.id)) return res.status(404).json({ error: "Discount not found" });
+    if (!(await deleteDiscount(req.params.id))) return res.status(404).json({ error: "Discount not found" });
     return res.json({ success: true });
   } catch {
     return res.status(500).json({ error: "Unable to delete discount" });
   }
 });
 
-app.post("/api/discounts/validate", publicDiscountRateLimit, (req, res) => {
+app.post("/api/discounts/validate", publicDiscountRateLimit, async (req, res) => {
   try {
-    const result = calculateDiscount(req.body?.code, req.body?.subtotal);
+    const code = (req.body?.code || "").toString().trim();
+    if (!code) return res.status(400).json({ valid: false, error: "Discount code is required" });
+
+    const result = await resolveDiscountForSubtotal(code, req.body?.subtotal);
     return res.json({ valid: true, ...result });
   } catch (e) {
     return res.status(400).json({ valid: false, error: e.message || "Invalid discount" });
   }
 });
 
-app.patch("/api/admin/discounts/:id/status", limitDiscountAdminRequests, requireAdmin, (req, res) => {
-  try {
-    if (typeof req.body?.active !== "boolean") {
-      return res.status(400).json({ error: "'active' boolean is required" });
-    }
-    const discount = updateDiscount(req.params.id, { active: req.body.active });
-    if (!discount) return res.status(404).json({ error: "Discount not found" });
-    return res.json(discount);
-  } catch (e) {
-    return res.status(400).json({ error: e.message || "Unable to update discount status" });
-  }
-});
 /* -------------------------
    Cloudflare R2 Upload (Admin)
 ------------------------- */
@@ -406,7 +576,7 @@ function requireR2Env() {
     "R2_ACCESS_KEY_ID",
     "R2_SECRET_ACCESS_KEY",
     "R2_BUCKET_NAME",
-    "R2_PUBLIC_BASE_URL"
+    "R2_PUBLIC_BASE_URL",
   ];
 
   const missing = required.filter((k) => !(process.env[k] || "").trim());
@@ -420,8 +590,8 @@ const r2 = new S3Client({
   endpoint: `https://${process.env.CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com`,
   credentials: {
     accessKeyId: process.env.R2_ACCESS_KEY_ID,
-    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
-  }
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+  },
 });
 
 const upload = multer({
@@ -430,7 +600,7 @@ const upload = multer({
   fileFilter: (req, file, cb) => {
     const ok = /^image\/(jpeg|png|webp)$/i.test(file.mimetype || "");
     cb(ok ? null : new Error("Only JPG/PNG/WebP allowed"), ok);
-  }
+  },
 });
 
 app.post("/api/admin/upload", requireAdmin, upload.single("image"), async (req, res) => {
@@ -449,7 +619,7 @@ app.post("/api/admin/upload", requireAdmin, upload.single("image"), async (req, 
         Bucket: process.env.R2_BUCKET_NAME,
         Key: key,
         Body: req.file.buffer,
-        ContentType: req.file.mimetype
+        ContentType: req.file.mimetype,
       })
     );
 
@@ -466,7 +636,7 @@ app.post("/api/admin/upload", requireAdmin, upload.single("image"), async (req, 
 /* -------------------------
    Orders
 ------------------------- */
-app.post("/api/orders", (req, res) => {
+app.post("/api/orders", async (req, res) => {
   try {
     const body = req.body || {};
     const discountCode = String(body.discountCode ?? "").trim();
@@ -476,7 +646,7 @@ app.post("/api/orders", (req, res) => {
       return res.status(400).json({ error: "Subtotal must be a non-negative number" });
     }
 
-    const discount = discountCode ? calculateDiscount(discountCode, subtotal) : null;
+    const discount = discountCode ? await resolveDiscountForSubtotal(discountCode, subtotal) : null;
     const total = discount ? discount.total : Number(body.total ?? subtotal);
     if (!Number.isFinite(total) || total < 0) {
       return res.status(400).json({ error: "Total must be a non-negative number" });
@@ -492,7 +662,7 @@ app.post("/api/orders", (req, res) => {
       finalTotal: total,
       ...(discount ? { discount } : {}),
       status: "paid",
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
     };
 
     createOrder(order);
@@ -504,7 +674,7 @@ app.post("/api/orders", (req, res) => {
     res.json({ success: true, order });
   } catch (e) {
     console.error("❌ ORDER SAVE FAILED", e);
-    res.status(400).json({ error: "Failed to save order" });
+    res.status(400).json({ error: e.message || "Failed to save order" });
   }
 });
 
@@ -523,9 +693,9 @@ async function paystackInitialize({ email, amount, currency }) {
     method: "POST",
     headers: {
       Authorization: `Bearer ${secret}`,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
     },
-    body: JSON.stringify({ email, amount, currency: currency || "GHS" })
+    body: JSON.stringify({ email, amount, currency: currency || "GHS" }),
   });
 
   const data = await r.json().catch(() => ({}));
@@ -584,4 +754,18 @@ app.get("/api/paystack/verify/:reference", handleVerify);
 app.post("/paystack/initialize", handleInitialize);
 app.get("/paystack/verify/:reference", handleVerify);
 
-app.listen(PORT, () => console.log("Server running on port", PORT));
+/* -------------------------
+   Bootstrap
+------------------------- */
+async function start() {
+  try {
+    await initDb();
+    await pool.query("SELECT 1");
+    app.listen(PORT, () => console.log("Server running on port", PORT));
+  } catch (e) {
+    console.error("❌ Failed to start server:", e);
+    process.exit(1);
+  }
+}
+
+start();
